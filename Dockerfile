@@ -43,7 +43,7 @@ RUN set -e; \
         cp /tmp/repo/bin/frankenphp /tmp/extract/bin/frankenphp 2>/dev/null || true; \
     else \
         echo "Downloading runtime package from GitHub..."; \
-        curl -fsSL -o /tmp/server.tar.gz "https://github.com/aiskendi/pencarimovie-server/releases/latest/download/pencarimovie-downloader-${ARCH_SUFFIX}.tar.gz"; \
+        curl -fsSL -o /tmp/server.tar.gz "https://github.com/satyavarthi/pencarimovie-server/releases/latest/download/pencarimovie-downloader-${ARCH_SUFFIX}.tar.gz"; \
         tar -xzf /tmp/server.tar.gz --strip-components=1 -C /tmp/extract; \
         rm -f /tmp/server.tar.gz; \
         echo "Overlaying repository files..."; \

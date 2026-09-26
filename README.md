@@ -32,14 +32,14 @@ Install and start the server with a single command:
 
 #### 📱 Android (APK)
 
-> [**📥 Direct APK Download (telegra.my/apk)**](https://telegra.my/apk) _(Install, tap Start Server, and stream)_
+> [**📥 Direct APK Download (github.com/satyavarthi/pencarimovie-server/releases/latest/apk)**](https://github.com/satyavarthi/pencarimovie-server/releases/tag/apk-latest) _(Install, tap Start Server, and stream)_
 
 #### 🪟 Windows (10/11)
 
 Run in PowerShell:
 
 ```powershell
-irm telegra.my/win | iex
+irm https://github.com/satyavarthi/pencarimovie-server/releases/latest/download/install.ps1 | iex
 ```
 
 #### 🐧 Linux
@@ -47,7 +47,7 @@ irm telegra.my/win | iex
 Run in terminal:
 
 ```bash
-curl -fsSL telegra.my/linux | bash
+curl -fsSL github.com/satyavarthi/pencarimovie-server/releases/latest/linux | bash
 ```
 
 #### 🍏 macOS (Apple Silicon & Intel)
@@ -55,7 +55,7 @@ curl -fsSL telegra.my/linux | bash
 Run in terminal:
 
 ```bash
-curl -fsSL telegra.my/mac | bash
+curl -fsSL github.com/satyavarthi/pencarimovie-server/releases/latest/mac | bash
 ```
 
 #### 🤖 Android (Termux)
@@ -63,7 +63,7 @@ curl -fsSL telegra.my/mac | bash
 Run in Termux:
 
 ```bash
-curl -fsSL telegra.my/termux | bash
+curl -fsSL github.com/satyavarthi/pencarimovie-server/releases/latest/termux | bash
 ```
 
 #### 🐳 Docker (Any OS / NAS)
@@ -76,7 +76,7 @@ docker run -d \
   --restart unless-stopped \
   -p 8088:8088 \
   -v pencarimovie-data:/app/storage \
-  ghcr.io/aiskendi/pencarimovie-server:latest
+  ghcr.io/satyavarthi/pencarimovie-server:latest
 ```
 
 Or using `docker-compose.yml`:
@@ -84,7 +84,7 @@ Or using `docker-compose.yml`:
 ```yaml
 services:
   pencarimovie:
-    image: ghcr.io/aiskendi/pencarimovie-server:latest
+    image: ghcr.io/satyavarthi/pencarimovie-server:latest
     container_name: pencarimovie-server
     restart: unless-stopped
     ports:
@@ -255,5 +255,5 @@ Built on the shoulders of these fantastic open-source projects:
 ---
 
 <p align="center">
-  <sub>Open-source project hosted at <a href="https://github.com/aiskendi/pencarimovie-server">github.com/aiskendi/pencarimovie-server</a></sub>
+  <sub>Standalone open-source media server maintained in this repository.</sub>
 </p>
