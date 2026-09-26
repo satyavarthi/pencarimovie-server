@@ -237,7 +237,10 @@ class PencariMovieApp {
           }
           if (addBotsStatus) addBotsStatus.textContent = tokenAddResult.message;
         }
-      } else if (hash === '#settings') {
+      } else if (hash === '#library') {
+      this.openLibrary();
+      this.loadInitialData().catch((err) => console.warn('Background init data load failed:', err));
+    } else if (hash === '#settings') {
         // Instant show settings card without waiting for initial catalog/media data
         this.showSettingsGate({ forceToken: !this.botId });
         this.loadInitialData().catch((err) => console.warn('Background init data load failed:', err));
@@ -4321,9 +4324,11 @@ class PencariMovieApp {
     const manifestCatalogs = (this.manifest && Array.isArray(this.manifest.catalogs)) ? this.manifest.catalogs : [];
     const hasLocalCatalogs = manifestCatalogs.some((cat) => !String(cat.id || '').startsWith('up_'));
     if (this.categories.length === 0 && !hasLocalCatalogs) {
-      container.innerHTML = '';
+      container.innerHTML = '<button class="stream-nav__link" data-category="library"><i class="fas fa-bookmark"></i> Library</button>';
       const mobileEmpty = this.$('#mobileNavLinks');
-      if (mobileEmpty) mobileEmpty.innerHTML = '';
+      if (mobileEmpty) mobileEmpty.innerHTML = '<button class="stream-mobile-nav__link" data-category="library"><i class="fas fa-bookmark"></i> Library</button>';
+      container.querySelector('.stream-nav__link')?.addEventListener('click', () => { this.openLibrary(); this.closeMobileNav(); });
+      mobileEmpty?.querySelector('.stream-mobile-nav__link')?.addEventListener('click', () => { this.openLibrary(); this.closeMobileNav(); });
       return;
     }
 
