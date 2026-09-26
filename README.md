@@ -32,14 +32,14 @@ Install and start the server with a single command:
 
 #### 📱 Android (APK)
 
-> [**📥 Direct APK Download (telegra.my/apk)**](https://telegra.my/apk) _(Install, tap Start Server, and stream)_
+> [**📥 Direct APK Download (telegra.my/apk)**](https://github.com/satyavarthi/pencarimovie-server/releases/tag/apk-latest) _(Install, tap Start Server, and stream)_
 
 #### 🪟 Windows (10/11)
 
 Run in PowerShell:
 
 ```powershell
-irm telegra.my/win | iex
+irm https://github.com/satyavarthi/pencarimovie-server/releases/latest/download/install.ps1 | iex
 ```
 
 #### 🐧 Linux
@@ -76,7 +76,7 @@ docker run -d \
   --restart unless-stopped \
   -p 8088:8088 \
   -v pencarimovie-data:/app/storage \
-  ghcr.io/aiskendi/pencarimovie-server:latest
+  ghcr.io/satyavarthi/pencarimovie-server:latest
 ```
 
 Or using `docker-compose.yml`:
@@ -84,7 +84,7 @@ Or using `docker-compose.yml`:
 ```yaml
 services:
   pencarimovie:
-    image: ghcr.io/aiskendi/pencarimovie-server:latest
+    image: ghcr.io/satyavarthi/pencarimovie-server:latest
     container_name: pencarimovie-server
     restart: unless-stopped
     ports:
@@ -255,5 +255,5 @@ Built on the shoulders of these fantastic open-source projects:
 ---
 
 <p align="center">
-  <sub>Open-source project hosted at <a href="https://github.com/aiskendi/pencarimovie-server">github.com/aiskendi/pencarimovie-server</a></sub>
+  <sub>Open-source project hosted at <a href="https://github.com/satyavarthi/pencarimovie-server">github.com/aiskendi/pencarimovie-server</a></sub>
 </p>
