@@ -4340,7 +4340,9 @@ class PencariMovieApp {
       { name: 'Korean', slug: 'korean' }
     ];
 
-    container.innerHTML = categories.map((cat) =>
+    container.innerHTML = `
+      <button class="stream-nav__link" data-category="library"><i class="fas fa-bookmark"></i> Library</button>
+    ` + categories.map((cat) =>
       `<button class="stream-nav__link" data-category="${this.escapeHtml(cat.slug)}">
         ${this.escapeHtml(cat.name)}
       </button>`
@@ -4350,7 +4352,8 @@ class PencariMovieApp {
       btn.addEventListener('click', () => {
         const slug = btn.getAttribute('data-category');
         const cat = categories.find(c => c.slug === slug);
-        this.openCategoryPage(slug, cat ? cat.name : slug);
+        if (slug === 'library') this.openLibrary();
+        else this.openCategoryPage(slug, cat ? cat.name : slug);
         this.closeMobileNav();
       });
     });
@@ -4358,7 +4361,9 @@ class PencariMovieApp {
     // Also render mobile nav links
     const mobileContainer = this.$('#mobileNavLinks');
     if (mobileContainer) {
-      mobileContainer.innerHTML = categories.map((cat) =>
+      mobileContainer.innerHTML = `
+        <button class="stream-mobile-nav__link" data-category="library"><i class="fas fa-bookmark"></i> Library</button>
+      ` + categories.map((cat) =>
         `<button class="stream-mobile-nav__link" data-category="${this.escapeHtml(cat.slug)}">
           ${this.escapeHtml(cat.name)}
         </button>`
@@ -4368,7 +4373,8 @@ class PencariMovieApp {
         btn.addEventListener('click', () => {
           const slug = btn.getAttribute('data-category');
           const cat = categories.find(c => c.slug === slug);
-          this.openCategoryPage(slug, cat ? cat.name : slug);
+          if (slug === 'library') this.openLibrary();
+          else this.openCategoryPage(slug, cat ? cat.name : slug);
           this.closeMobileNav();
         });
       });
@@ -5572,8 +5578,116 @@ class PencariMovieApp {
       this.$('#fileDetailDownloadBtn').innerHTML = '<i class="fas fa-download"></i> No file ID';
     }
 
+    this._renderLibraryButton(shortCode, data, title, thumbnail, fileSize);
+
     // Render sponsored button in File Detail page if configured
     this._renderFileDetailSponsor();
+  }
+
+  getLibrary() {
+    try {
+      const raw = localStorage.getItem('pm.library');
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (_) { return []; }
+  }
+
+  _saveLibrary(items) {
+    localStorage.setItem('pm.library', JSON.stringify(items.slice(0, 500)));
+  }
+
+  toggleLibraryItem(item) {
+    const items = this.getLibrary();
+    const idx = items.findIndex(x => String(x.shortCode) === String(item.shortCode));
+    if (idx >= 0) items.splice(idx, 1);
+    else items.unshift({ ...item, savedAt: Date.now() });
+    this._saveLibrary(items);
+    return idx < 0;
+  }
+
+  isInLibrary(shortCode) {
+    return this.getLibrary().some(x => String(x.shortCode) === String(shortCode));
+  }
+
+  openLibrary() {
+    let page = this.$('#pmLibraryPage');
+    if (!page) {
+      page = document.createElement('section');
+      page.id = 'pmLibraryPage';
+      page.className = 'category-page pm-library-page';
+      document.body.appendChild(page);
+    }
+    const items = this.getLibrary();
+    page.innerHTML = `
+      <header class="category-page__header">
+        <button class="category-page__back-btn" id="pmLibraryBack"><i class="fas fa-arrow-left"></i> Back</button>
+        <h2 class="category-page__title">My Library <span style="opacity:.5;font-size:.8em">(${items.length})</span></h2>
+      </header>
+      <div class="category-page__grid pm-library-grid">
+        ${items.length ? items.map(item => `
+          <article class="stream-card pm-library-card" data-short-code="${this.escapeHtml(item.shortCode || '')}">
+            <div class="stream-card__thumb-wrap">
+              <img class="stream-card__thumb" loading="lazy" src="${this.escapeHtml(item.thumbnail || '')}" alt="">
+            </div>
+            <div class="stream-card__info">
+              <div class="stream-card__title">${this.escapeHtml(item.title || item.shortCode || 'Saved item')}</div>
+              <div class="stream-card__meta">${this.escapeHtml(item.meta || '')}</div>
+              <button class="pm-library-remove" data-library-remove="${this.escapeHtml(item.shortCode || '')}"><i class="fas fa-trash"></i> Remove</button>
+            </div>
+          </article>`).join('') : `
+          <div class="pm-library-empty"><i class="fas fa-bookmark"></i><h3>Your library is empty</h3><p>Save movies and files from their detail page to keep them here.</p></div>
+        `}
+      </div>`;
+    page.classList.remove('hidden');
+    page.setAttribute('aria-hidden','false');
+    page.querySelector('#pmLibraryBack')?.addEventListener('click', () => this.closeLibrary());
+    page.querySelectorAll('[data-library-remove]').forEach(btn => btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const code = btn.getAttribute('data-library-remove');
+      this._saveLibrary(this.getLibrary().filter(x => String(x.shortCode) !== String(code)));
+      this.openLibrary();
+    }));
+    page.querySelectorAll('.pm-library-card').forEach(card => card.addEventListener('click', (e) => {
+      if (e.target.closest('[data-library-remove]')) return;
+      const code = card.getAttribute('data-short-code');
+      if (code) this.openFileDetail(code);
+    }));
+    history.replaceState({}, '', '#library');
+  }
+
+  closeLibrary() {
+    const page = this.$('#pmLibraryPage');
+    if (page) page.classList.add('hidden');
+    if (location.hash === '#library') history.replaceState({}, '', location.pathname);
+  }
+
+  _renderLibraryButton(shortCode, data, title, thumbnail, fileSize) {
+    const actions = this.$('#fileDetailActions');
+    if (!actions) return;
+    let btn = this.$('#fileDetailLibraryBtn');
+    if (!btn) {
+      btn = document.createElement('button');
+      btn.id = 'fileDetailLibraryBtn';
+      btn.className = 'file-detail__download-btn pm-library-action';
+      actions.appendChild(btn);
+    }
+    const refresh = () => {
+      const saved = this.isInLibrary(shortCode);
+      btn.innerHTML = saved ? '<i class="fas fa-bookmark"></i> Saved' : '<i class="far fa-bookmark"></i> Save';
+      btn.classList.toggle('pm-library-action--saved', saved);
+    };
+    btn.onclick = () => {
+      this.toggleLibraryItem({
+        shortCode,
+        title,
+        thumbnail,
+        fileSize,
+        meta: fileSize ? this.formatSize(fileSize) : '',
+        type: data?.type || data?.file_type || ''
+      });
+      refresh();
+    };
+    refresh();
   }
 
   /**
