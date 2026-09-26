@@ -144,6 +144,32 @@ if exist "%cd%\tray.ps1" (
 )
 
 echo.
+rem Do not claim success until the server actually accepts connections.
+set "START_OK=0"
+for /l %%N in (1,1,15) do (
+    curl -s -o nul http://127.0.0.1:%PORT% >nul 2>&1
+    if not errorlevel 1 (
+        set "START_OK=1"
+        goto start_verified
+    )
+    powershell -NoProfile -Command "try { $r=Invoke-WebRequest -Uri 'http://127.0.0.1:%PORT%' -Method HEAD -TimeoutSec 1; exit 0 } catch { exit 1 }" >nul 2>&1
+    if not errorlevel 1 (
+        set "START_OK=1"
+        goto start_verified
+    )
+    ping 127.0.0.1 -n 2 >nul
+)
+:start_verified
+if "%START_OK%"=="0" (
+    echo.
+    echo ERROR: PencariMovie Server failed to start on port %PORT%.
+    if exist "%APP_DIR%\storage\tray.log" (
+        echo.
+        echo Last tray log:
+        powershell -NoProfile -Command "Get-Content -LiteralPath '%APP_DIR%\storage\tray.log' -Tail 12"
+    )
+    exit /b 1
+)
 echo PencariMovie Server is running in the background.
 call :print_urls
 echo   CLI:      pms [start^|stop^|restart^|tunnel^|autostart]
