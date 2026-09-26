@@ -3,7 +3,8 @@ setlocal enabledelayedexpansion
 title PencariMovie Server
 call :print_banner
 
-set "REPO=satyavarthi/pencarimovie-server"
+set "REPO=aiskendi/pencarimovie-server"
+set "CUSTOM_REPO=satyavarthi/pencarimovie-server"
 set "FALLBACK_TAG=v1.0.0"
 set "PORT=8088"
 set "HAD_APP=0"
@@ -341,7 +342,13 @@ if not defined LATEST (
 )
 
 if "!IS_INSTALLED!"=="1" if defined CURRENT if /I "!CURRENT!"=="!LATEST!" (
-    echo Already up to date.
+    echo Upstream core is already up to date; refreshing customized UI...
+    set "OTA_TAG=!LATEST!"
+    if not exist "%~dp0update.ps1" (
+        powershell -NoProfile -Command "$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/%CUSTOM_REPO%/main/update.ps1' -OutFile '%~dp0update.ps1' -UseBasicParsing -TimeoutSec 60; Unblock-File -LiteralPath '%~dp0update.ps1' -ErrorAction SilentlyContinue"
+    )
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0update.ps1" -AppDir "!APP_PATH!" -Repo "%REPO%" -Tag "!LATEST!" -Installed 1 -OverlayOnly
+    if errorlevel 1 echo Warning: customized UI refresh failed; keeping the working server.
     goto :eof
 )
 
@@ -365,7 +372,7 @@ rem present yet. Fetch it from the repo (a plain file download, not an
 rem extract/execute) before delegating.
 if not exist "%~dp0update.ps1" (
     echo Fetching update.ps1...
-    powershell -NoProfile -Command "$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/%REPO%/main/update.ps1' -OutFile '%~dp0update.ps1' -UseBasicParsing -TimeoutSec 60; Unblock-File -LiteralPath '%~dp0update.ps1' -ErrorAction SilentlyContinue"
+    powershell -NoProfile -Command "$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/%CUSTOM_REPO%/main/update.ps1' -OutFile '%~dp0update.ps1' -UseBasicParsing -TimeoutSec 60; Unblock-File -LiteralPath '%~dp0update.ps1' -ErrorAction SilentlyContinue"
 )
 
 if not exist "%~dp0update.ps1" (
@@ -374,7 +381,7 @@ if not exist "%~dp0update.ps1" (
     exit /b 1
 )
 
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0update.ps1" -AppDir "!APP_PATH!" -Repo "%REPO%" -Tag "!LATEST!" -Installed !IS_INSTALLED!
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0update.ps1" -AppDir "!APP_PATH!" -Repo "%REPO%" -CustomRepo "%CUSTOM_REPO%" -Tag "!LATEST!" -Installed !IS_INSTALLED!
 if errorlevel 1 (
     echo Update failed.
     pause
