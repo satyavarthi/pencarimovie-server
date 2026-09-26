@@ -340,33 +340,66 @@ function Start-AppServer {
         return
     }
 
+    function Start-ServerProcess([string]$file, [string[]]$args, [string]$label) {
+        $logDir = Join-Path $root 'storage'
+        if (-not (Test-Path -LiteralPath $logDir)) {
+            New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+        }
+        $stdout = Join-Path $logDir 'server.stdout.log'
+        $stderr = Join-Path $logDir 'server.stderr.log'
+        try {
+            $proc = Start-Process -FilePath $file -ArgumentList $args -WorkingDirectory $root `
+                -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+            Write-TrayLog "$label pid=$($proc.Id)"
+            return $proc
+        }
+        catch {
+            Write-TrayLog "$label launch failed: $($_.Exception.Message)"
+            return $null
+        }
+    }
+
+    function Log-ServerErrors {
+        $stderr = Join-Path $root 'storage\server.stderr.log'
+        $stdout = Join-Path $root 'storage\server.stdout.log'
+        foreach ($file in @($stderr, $stdout)) {
+            if (Test-Path -LiteralPath $file) {
+                $lines = Get-Content -LiteralPath $file -Tail 12 -ErrorAction SilentlyContinue
+                foreach ($line in $lines) {
+                    if ($line) { Write-TrayLog "server: $line" }
+                }
+            }
+        }
+    }
+
     $franken = Join-Path $root 'bin\frankenphp.exe'
     if (Test-Path -LiteralPath $franken) {
-        Write-TrayLog "starting hidden frankenphp $franken"
+        Write-TrayLog "starting frankenphp $franken"
         $caddyfile = Join-Path $root 'Caddyfile'
         if (Test-Path -LiteralPath $caddyfile) {
-            $script:serverProc = Start-HiddenProcess -FileName $franken -Arguments @('run', '--config', $caddyfile)
+            $script:serverProc = Start-ServerProcess $franken @('run', '--config', $caddyfile) 'frankenphp'
         }
         else {
-            $script:serverProc = Start-HiddenProcess -FileName $franken -Arguments @('php-server', '--listen', "0.0.0.0:$Port", '--root', $root)
+            $script:serverProc = Start-ServerProcess $franken @('php-server', '--listen', "0.0.0.0:$Port", '--root', $root) 'frankenphp'
         }
         if ($script:serverProc) {
-            Write-TrayLog "frankenphp pid=$($script:serverProc.Id)"
-            Start-Sleep -Milliseconds 750
+            Start-Sleep -Milliseconds 1000
             if ($script:serverProc.HasExited) {
-                Write-TrayLog "frankenphp exited immediately code=$($script:serverProc.ExitCode); falling back to php-server"
+                Write-TrayLog "frankenphp exited immediately code=$($script:serverProc.ExitCode)"
+                Log-ServerErrors
                 $script:serverProc = $null
             }
         }
         if (-not $script:serverProc) {
-            try {
-                $script:serverProc = Start-HiddenProcess -FileName $franken -Arguments @('php-server', '--listen', "0.0.0.0:$Port", '--root', $root)
-                if ($script:serverProc) {
-                    Write-TrayLog "frankenphp php-server fallback pid=$($script:serverProc.Id)"
+            Write-TrayLog "starting frankenphp php-server fallback"
+            $script:serverProc = Start-ServerProcess $franken @('php-server', '--listen', "0.0.0.0:$Port", '--root', $root) 'frankenphp fallback'
+            if ($script:serverProc) {
+                Start-Sleep -Milliseconds 1000
+                if ($script:serverProc.HasExited) {
+                    Write-TrayLog "frankenphp fallback exited code=$($script:serverProc.ExitCode)"
+                    Log-ServerErrors
+                    $script:serverProc = $null
                 }
-            }
-            catch {
-                Write-TrayLog ("php-server fallback failed: " + $_.Exception.Message)
             }
         }
         return
@@ -379,17 +412,21 @@ function Start-AppServer {
         elseif ($php.Path) { $phpPath = $php.Path }
     }
     if ($phpPath) {
-        Write-TrayLog "starting hidden php $phpPath"
-        $script:serverProc = Start-HiddenProcess -FileName $phpPath -Arguments @('-S', "0.0.0.0:$Port", 'router.php')
+        Write-TrayLog "starting php $phpPath"
+        $script:serverProc = Start-ServerProcess $phpPath @('-S', "0.0.0.0:$Port", 'router.php') 'php'
         if ($script:serverProc) {
-            Write-TrayLog "php pid=$($script:serverProc.Id)"
+            Start-Sleep -Milliseconds 500
+            if ($script:serverProc.HasExited) {
+                Write-TrayLog "php exited immediately code=$($script:serverProc.ExitCode)"
+                Log-ServerErrors
+                $script:serverProc = $null
+            }
         }
         return
     }
 
     throw 'PHP or FrankenPHP is required but was not found.'
 }
-
 function Stop-AppServer {
     if ($script:serverProc) {
         try {
