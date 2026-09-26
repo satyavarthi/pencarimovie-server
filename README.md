@@ -16,6 +16,19 @@
 
 ---
 
+## Project architecture
+
+This repository keeps the **upstream PencariMovie Server runtime** as the functional core and layers the customized product UI/features from this repository on top.
+
+- Core server/runtime updates are sourced from `aiskendi/pencarimovie-server`.
+- The customized web UI is sourced from this repository's `public/` directory.
+- Installed updates preserve `storage/` and do not replace user data.
+- Windows, Linux, macOS, and Termux installers update the upstream runtime and then overlay the customized UI.
+- Docker follows the same model: upstream runtime + this repository's `public/` UI.
+- A developer checkout remains runnable directly from the working tree, so local development does not depend on a network request for every start.
+
+This separation is intentional: upstream backend functionality can continue to evolve without overwriting the customized interface.
+
 ## What is PencariMovie Server?
 
 **PencariMovie Server** runs a lightweight streaming engine on your local machine, home server, or Android device. It turns Telegram media into direct, high-speed HTTP streams with instant seeking for **Stremio**, **Nuvio**, or the built-in Netflix-style web player.

@@ -33,7 +33,8 @@ else
 fi
 PORT="${PORT:-8088}"
 HOST="${HOST:-0.0.0.0}"
-REPO="satyavarthi/pencarimovie-server"
+REPO="aiskendi/pencarimovie-server"
+CUSTOM_REPO="satyavarthi/pencarimovie-server"
 FALLBACK_TAG="v1.0.0"
 
 detect_target() {
@@ -226,6 +227,25 @@ migrate_legacy_dir() {
   fi
 }
 
+overlay_custom_ui() {
+  local tmp_ui="${TMPDIR:-/tmp}/pencarimovie-ui-$"
+  mkdir -p "$tmp_ui" "$APP_DIR/public"
+  local name
+  for name in index.html app.js styles.css stream-theme.css logo.png; do
+    local url="https://raw.githubusercontent.com/$CUSTOM_REPO/main/public/$name"
+    if ! download_file "$url" "$tmp_ui/$name" 2>/dev/null || [ ! -s "$tmp_ui/$name" ]; then
+      echo "Warning: customized UI asset $name could not be refreshed; keeping the existing asset."
+      rm -rf "$tmp_ui"
+      return 0
+    fi
+  done
+  for name in index.html app.js styles.css stream-theme.css logo.png; do
+    cp -f "$tmp_ui/$name" "$APP_DIR/public/$name"
+  done
+  rm -rf "$tmp_ui"
+  echo "Customized UI applied from $CUSTOM_REPO."
+}
+
 copy_release_into_app() {
   local src="$1" item name
   mkdir -p "$APP_DIR"
@@ -288,6 +308,7 @@ download_extract() {
   tar -xzf "$tmp/pencarimovie.tar.gz" -C "$tmp/extract"
   src="$(find_release_root "$tmp/extract")"
   copy_release_into_app "$src"
+  overlay_custom_ui
   strip_crlf "$APP_DIR"
   # On macOS, clear quarantine flags from downloaded binaries
   if [ "$(uname -s)" = "Darwin" ]; then
@@ -322,14 +343,16 @@ install_or_update() {
 
   if [ -z "$latest" ]; then
     if [ "$is_installed" -eq 1 ]; then
-      echo "Could not check GitHub for updates; using installed copy."
+      echo "Could not check upstream GitHub for updates; using installed core and refreshing customized UI."
+      overlay_custom_ui
       return 1
     fi
     latest="$FALLBACK_TAG"
   fi
 
   if [ "$is_installed" -eq 1 ] && [ "$current" = "$latest" ]; then
-    echo "Already up to date [$current]."
+    echo "Upstream core is already up to date [$current]; refreshing customized UI."
+    overlay_custom_ui
     return 1
   fi
 

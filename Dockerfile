@@ -20,6 +20,9 @@ WORKDIR /app
 # When TARGETARCH=amd64 -> linux-x86_64; TARGETARCH=arm64 -> linux-aarch64
 COPY . /tmp/repo/
 
+ARG UPSTREAM_REPO=aiskendi/pencarimovie-server
+ARG UPSTREAM_TAG=latest
+
 RUN set -e; \
     ARCH_SUFFIX=""; \
     if [ "$TARGETARCH" = "arm64" ] || [ "$(uname -m)" = "aarch64" ]; then \
@@ -27,37 +30,27 @@ RUN set -e; \
     else \
         ARCH_SUFFIX="linux-x86_64"; \
     fi; \
-    TAR_PATH="/tmp/repo/dist/pencarimovie-downloader-${ARCH_SUFFIX}.tar.gz"; \
     mkdir -p /tmp/extract; \
-    if [ -f "$TAR_PATH" ]; then \
-        echo "Extracting local release package: $TAR_PATH"; \
-        tar -xzf "$TAR_PATH" -C /tmp/extract; \
-    elif [ -f "/tmp/repo/backend.php" ] && [ -x "/tmp/repo/bin/frankenphp" ] && [ -d "/tmp/repo/vendor" ]; then \
-        echo "Copying workspace files directly..."; \
-        cp -r /tmp/repo/public /tmp/repo/backend.php /tmp/repo/index.php /tmp/repo/router.php /tmp/repo/Caddyfile /tmp/extract/ 2>/dev/null || true; \
-        cp -r /tmp/repo/vendor /tmp/extract/; \
-        if [ -d "/tmp/repo/src" ]; then cp -r /tmp/repo/src /tmp/extract/; fi; \
-        mkdir -p /tmp/extract/bin; \
-        cp /tmp/repo/bin/php /tmp/extract/bin/php 2>/dev/null || true; \
-        cp /tmp/repo/bin/php.ini.unix /tmp/extract/bin/php.ini 2>/dev/null || true; \
-        cp /tmp/repo/bin/frankenphp /tmp/extract/bin/frankenphp 2>/dev/null || true; \
+    echo "Downloading upstream runtime from ${UPSTREAM_REPO} (${UPSTREAM_TAG})..."; \
+    if [ "$UPSTREAM_TAG" = "latest" ]; then \
+        curl -fsSL -o /tmp/server.tar.gz "https://github.com/${UPSTREAM_REPO}/releases/latest/download/pencarimovie-downloader-${ARCH_SUFFIX}.tar.gz" || \
+        curl -fsSL -o /tmp/server.tar.gz "https://github.com/${UPSTREAM_REPO}/releases/latest/download/pencarimovie-server.tar.gz"; \
     else \
-        echo "Downloading runtime package from GitHub..."; \
-        curl -fsSL -o /tmp/server.tar.gz "https://github.com/satyavarthi/pencarimovie-server/releases/latest/download/pencarimovie-downloader-${ARCH_SUFFIX}.tar.gz"; \
-        tar -xzf /tmp/server.tar.gz --strip-components=1 -C /tmp/extract; \
-        rm -f /tmp/server.tar.gz; \
-        echo "Overlaying repository files..."; \
-        cp -r /tmp/repo/public /tmp/repo/backend.php /tmp/repo/index.php /tmp/repo/router.php /tmp/repo/Caddyfile /tmp/extract/ 2>/dev/null || true; \
-        if [ -d "/tmp/repo/vendor" ]; then cp -r /tmp/repo/vendor /tmp/extract/; fi; \
-        if [ -d "/tmp/repo/src" ]; then cp -r /tmp/repo/src /tmp/extract/; fi; \
-        if [ -f "/tmp/repo/bin/php.ini.unix" ]; then cp /tmp/repo/bin/php.ini.unix /tmp/extract/bin/php.ini 2>/dev/null || true; fi; \
+        curl -fsSL -o /tmp/server.tar.gz "https://github.com/${UPSTREAM_REPO}/releases/download/${UPSTREAM_TAG}/pencarimovie-downloader-${ARCH_SUFFIX}.tar.gz" || \
+        curl -fsSL -o /tmp/server.tar.gz "https://github.com/${UPSTREAM_REPO}/releases/download/${UPSTREAM_TAG}/pencarimovie-server.tar.gz"; \
     fi; \
+    tar -xzf /tmp/server.tar.gz --strip-components=1 -C /tmp/extract; \
+    rm -f /tmp/server.tar.gz; \
+    test -f /tmp/extract/backend.php; \
+    echo "Overlaying repository-owned UI only..."; \
+    rm -rf /tmp/extract/public; \
+    cp -r /tmp/repo/public /tmp/extract/public; \
     cp -a /tmp/extract/. /app/; \
     rm -rf /tmp/extract /tmp/repo; \
     mkdir -p /app/storage; \
     chmod -R 777 /app/storage; \
     chmod +x /app/bin/frankenphp /app/bin/php /app/bin/ffmpeg 2>/dev/null || true; \
-    test -x /app/bin/frankenphp || (echo "FATAL: /app/bin/frankenphp is missing or not executable!" && exit 1)
+    test -x /app/bin/frankenphp || (echo "FATAL: upstream /app/bin/frankenphp is missing or not executable!" && exit 1)
 
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
