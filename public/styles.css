@@ -3144,3 +3144,23 @@ button, input, textarea, select { font: inherit; }
   .stream-content-row__header { padding-inline: .85rem; }
   .stream-card:hover { transform: none; }
 }
+
+/* Personal Library */
+.pm-library-page { z-index: 1200; }
+.pm-library-grid { align-items: start; }
+.pm-library-card { cursor: pointer; position: relative; }
+.pm-library-remove {
+  margin-top: .65rem; padding: .45rem .7rem; border-radius: 9px;
+  border: 1px solid rgba(255,255,255,.08); background: rgba(255,255,255,.05);
+  color: #aeb6c4; cursor: pointer;
+}
+.pm-library-remove:hover { background: rgba(229,9,20,.16); color: #fff; }
+.pm-library-action { margin-left: .5rem; }
+.pm-library-action--saved { border-color: rgba(229,9,20,.42) !important; }
+.pm-library-empty {
+  grid-column: 1 / -1; min-height: 38vh; display: grid; place-content: center;
+  text-align: center; color: var(--pm-muted);
+}
+.pm-library-empty i { font-size: 2.5rem; margin-bottom: 1rem; color: rgba(255,255,255,.28); }
+.pm-library-empty h3 { margin: 0 0 .45rem; color: var(--pm-text); }
+.pm-library-empty p { margin: 0; max-width: 34rem; }
