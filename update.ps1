@@ -18,14 +18,55 @@
 param(
     [Parameter(Mandatory = $true)][string]$AppDir,
     [Parameter(Mandatory = $true)][string]$Repo,
+    [string]$CustomRepo = "satyavarthi/pencarimovie-server",
+    [switch]$OverlayOnly,
     [Parameter(Mandatory = $true)][string]$Tag,
     [int]$Installed = 0
 )
 
 $ErrorActionPreference = 'Stop'
+function Overlay-CustomUi {
+    param([string]$TargetDir, [string]$SourceRepo)
+    $publicDir = Join-Path $TargetDir 'public'
+    New-Item -ItemType Directory -Path $publicDir -Force | Out-Null
+    $files = @('index.html','app.js','styles.css','stream-theme.css','logo.png')
+    $tmpUi = Join-Path $env:TEMP ("pencarimovie-ui-" + (Get-Random))
+    New-Item -ItemType Directory -Path $tmpUi -Force | Out-Null
+    try {
+        foreach ($name in $files) {
+            $url = "https://raw.githubusercontent.com/$SourceRepo/main/public/$name"
+            $dest = Join-Path $tmpUi $name
+            try {
+                Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing -TimeoutSec 30
+            } catch {
+                throw "UI asset '$name' could not be downloaded: $($_.Exception.Message)"
+            }
+            if (-not (Test-Path -LiteralPath $dest) -or (Get-Item -LiteralPath $dest).Length -eq 0) {
+                throw "UI asset '$name' was empty."
+            }
+        }
+        foreach ($name in $files) {
+            Copy-Item -LiteralPath (Join-Path $tmpUi $name) -Destination (Join-Path $publicDir $name) -Force
+        }
+        Write-Host "Customized UI applied from $SourceRepo."
+    } finally {
+        Remove-Item -Recurse -Force $tmpUi -ErrorAction SilentlyContinue
+    }
+}
+
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 $base = "https://github.com/$Repo/releases/download/$Tag"
+
+if ($OverlayOnly) {
+    try {
+        Overlay-CustomUi -TargetDir $AppDir -SourceRepo $CustomRepo
+        exit 0
+    } catch {
+        Write-Host "Customized UI overlay failed: $($_.Exception.Message)"
+        exit 1
+    }
+}
 
 # Always use the native Windows package as primary to preserve Windows bin/ runtime and DLL configs
 $primary = @{ Url = "$base/pencarimovie-downloader-windows-x86_64.zip"; Name = 'pencarimovie.zip' }
@@ -138,7 +179,7 @@ opcache.enable_cli=0
     Set-Content -LiteralPath $iniPath -Value $defaultIni -Encoding ASCII
 }
 
-Set-Content -LiteralPath (Join-Path $AppDir '.release-tag') -Value $Tag -Encoding ASCII
+try { Overlay-CustomUi -TargetDir $AppDir -SourceRepo $CustomRepo } catch { Write-Host "Warning: customized UI overlay failed: $($_.Exception.Message)" }`n`nSet-Content -LiteralPath (Join-Path $AppDir '.release-tag') -Value $Tag -Encoding ASCII
 Remove-Item -Recurse -Force $otaTmp -ErrorAction SilentlyContinue
 Write-Host "Update applied: $Tag"
 exit 0
