@@ -3,11 +3,13 @@ name: Test Release Build & Installers
 on:
   workflow_dispatch:
   push:
-    branches: [main, master]
+    branches: [main, master, 'codex/**']
     paths:
       - "pencarimovie-linux.sh"
       - "pencarimovie-termux.sh"
       - "backend.php"
+      - "public/**"
+      - "public/index.html"
       - "scripts/**"
       - ".github/workflows/test-build.yml"
 
