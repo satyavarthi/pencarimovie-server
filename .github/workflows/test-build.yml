@@ -12,6 +12,10 @@ on:
       - "public/index.html"
       - "scripts/**"
       - ".github/workflows/test-build.yml"
+      - "pencarimovie-windows.bat"
+      - "update.ps1"
+      - "Dockerfile"
+      - "docker-compose.yml"
 
 jobs:
   test-installers:
@@ -42,6 +46,16 @@ jobs:
         run: |
           chmod +x pencarimovie-termux.sh
           bash -n pencarimovie-termux.sh
+
+      - name: Verify upstream-core/custom-UI separation
+        run: |
+          grep -q 'REPO="aiskendi/pencarimovie-server"' pencarimovie-linux.sh
+          grep -q 'CUSTOM_REPO="satyavarthi/pencarimovie-server"' pencarimovie-linux.sh
+          grep -q 'REPO=aiskendi/pencarimovie-server' pencarimovie-windows.bat
+          grep -q 'CUSTOM_REPO=satyavarthi/pencarimovie-server' pencarimovie-windows.bat
+          grep -q 'CustomRepo' update.ps1
+          grep -q 'UPSTREAM_REPO=aiskendi/pencarimovie-server' Dockerfile
+          grep -q 'Overlaying repository-owned UI only' Dockerfile
 
       - name: Test Server Boot & Manifest Response (Native PHP Mode)
         run: |
