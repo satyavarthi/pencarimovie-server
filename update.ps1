@@ -20,6 +20,7 @@ param(
     [Parameter(Mandatory = $true)][string]$Repo,
     [string]$CustomRepo = "satyavarthi/pencarimovie-server",
     [switch]$OverlayOnly,
+    [switch]$BootstrapOnly,
     [Parameter(Mandatory = $true)][string]$Tag,
     [int]$Installed = 0
 )
@@ -132,6 +133,53 @@ if (-not (Test-Path -LiteralPath $AppDir)) {
     New-Item -ItemType Directory -Path $AppDir -Force | Out-Null
 }
 
+# A developer git checkout needs only the packaged runtime. Extract that
+# runtime to a temporary directory and copy it into the working tree without
+# replacing checked-in application/core files.
+if ($BootstrapOnly) {
+    $runtimeTmp = Join-Path $env:TEMP ("pencarimovie-runtime-" + (Get-Random))
+    New-Item -ItemType Directory -Path $runtimeTmp -Force | Out-Null
+    try {
+        & tar.exe -xf $archive -C $runtimeTmp --strip-components=1 2>$null
+        if ($LASTEXITCODE -ne 0) { & tar.exe -xf $archive -C $runtimeTmp 2>$null }
+        $binSource = Join-Path $runtimeTmp 'bin'
+        if (-not (Test-Path -LiteralPath (Join-Path $binSource 'frankenphp.exe'))) {
+            throw 'The Windows release does not contain bin\\frankenphp.exe.'
+        }
+        New-Item -ItemType Directory -Path (Join-Path $AppDir 'bin') -Force | Out-Null
+        Copy-Item -LiteralPath $binSource -Destination (Join-Path $AppDir 'bin') -Recurse -Force
+        $vendorSource = Join-Path $runtimeTmp 'vendor'
+        if (Test-Path -LiteralPath $vendorSource) { Copy-Item -LiteralPath $vendorSource -Destination (Join-Path $AppDir 'vendor') -Recurse -Force }
+        $iniPath = Join-Path $AppDir 'bin\\php.ini'
+        $extDll = Join-Path $AppDir 'bin\\ext\\php_fileinfo.dll'
+        if ((Test-Path -LiteralPath $extDll) -and ((-not (Test-Path -LiteralPath $iniPath)) -or ((Get-Content $iniPath -ErrorAction SilentlyContinue | Select-String -Pattern '^\\s*extension=fileinfo') -eq $null))) {
+            $defaultIni = @'
+; TG FastDownloader bundled PHP/FrankenPHP config
+extension_dir="ext"
+extension=fileinfo
+extension=curl
+extension=mbstring
+extension=openssl
+extension=zip
+
+memory_limit = 512M
+
+opcache.enable=0
+opcache.enable_cli=0
+'@
+            Set-Content -LiteralPath $iniPath -Value $defaultIni -Encoding ASCII
+        }
+        Write-Host "Windows runtime bootstrapped into $AppDir."
+        exit 0
+    } catch {
+        Write-Host "Runtime bootstrap failed: $($_.Exception.Message)"
+        exit 1
+    } finally {
+        Remove-Item -Recurse -Force $runtimeTmp -ErrorAction SilentlyContinue
+        Remove-Item -Recurse -Force $otaTmp -ErrorAction SilentlyContinue
+    }
+}
+
 # Extract with tar.exe (handles both .zip and .tar.gz on Windows 10/11).
 # Archive entries are "./"-prefixed, so the exclude patterns must be too.
 # Without the "./" the running batch file is overwritten mid-execution.
@@ -179,7 +227,9 @@ opcache.enable_cli=0
     Set-Content -LiteralPath $iniPath -Value $defaultIni -Encoding ASCII
 }
 
-try { Overlay-CustomUi -TargetDir $AppDir -SourceRepo $CustomRepo } catch { Write-Host "Warning: customized UI overlay failed: $($_.Exception.Message)" }`n`nSet-Content -LiteralPath (Join-Path $AppDir '.release-tag') -Value $Tag -Encoding ASCII
+try { Overlay-CustomUi -TargetDir $AppDir -SourceRepo $CustomRepo } catch { Write-Host "Warning: customized UI overlay failed: $($_.Exception.Message)" }
+
+Set-Content -LiteralPath (Join-Path $AppDir '.release-tag') -Value $Tag -Encoding ASCII
 Remove-Item -Recurse -Force $otaTmp -ErrorAction SilentlyContinue
 Write-Host "Update applied: $Tag"
 exit 0
