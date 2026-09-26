@@ -3,14 +3,14 @@
 # PencariMovie Server - Docker Installer & Management CLI
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/aiskendi/pencarimovie-server/main/pencarimovie-docker.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/satyavarthi/pencarimovie-server/main/pencarimovie-docker.sh | bash
 #   pms-docker [start|stop|restart|logs|update|status|uninstall]
 # ==============================================================================
 set -euo pipefail
 
 APP_DIR="${APP_DIR:-$HOME/pencarimovie-docker}"
 PORT="${PORT:-8088}"
-REPO="aiskendi/pencarimovie-server"
+REPO="satyavarthi/pencarimovie-server"
 GITHUB_RAW="https://raw.githubusercontent.com/$REPO/main"
 
 # ── Docker Detection ─────────────────────────────────────────────────────────
@@ -111,14 +111,14 @@ do_start() {
     :
   else
     echo "Falling back to standalone docker run..."
-    docker pull ghcr.io/aiskendi/pencarimovie-server:latest 2>/dev/null || true
+    docker pull ghcr.io/satyavarthi/pencarimovie-server:latest 2>/dev/null || true
     docker rm -f pencarimovie-server 2>/dev/null || true
     docker run -d \
       --name pencarimovie-server \
       --restart unless-stopped \
       -p "${PORT}:8088" \
       -v "$APP_DIR/storage:/app/storage" \
-      ghcr.io/aiskendi/pencarimovie-server:latest
+      ghcr.io/satyavarthi/pencarimovie-server:latest
   fi
 
   local lan_ip
