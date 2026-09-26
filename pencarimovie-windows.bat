@@ -307,7 +307,19 @@ goto :eof
 
 :install_or_update
 if "%IN_PLACE%"=="1" (
-    echo Starting from this folder; skipping GitHub extract.
+    rem A fresh git checkout contains the source/UI but intentionally does not
+    rem track the platform runtime. Bootstrap only the runtime into this same
+    rem working tree; never replace the checked-in application source.
+    if exist "%APP_DIR%\bin\frankenphp.exe" (
+        echo Starting from this folder; using the existing bundled runtime.
+        goto :eof
+    )
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0update.ps1" -AppDir "%APP_DIR%" -Repo "%REPO%" -CustomRepo "%CUSTOM_REPO%" -Tag "%FALLBACK_TAG%" -BootstrapOnly
+    if errorlevel 1 (
+        echo Runtime bootstrap failed. Please run the command again or check the output above.
+        exit /b 1
+    )
+    echo Runtime bootstrapped into the developer checkout.
     goto :eof
 )
 set "APP_PATH=!APP_DIR!"
