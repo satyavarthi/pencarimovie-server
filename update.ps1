@@ -149,9 +149,24 @@ if ($BootstrapOnly) {
     $runtimeTmp = Join-Path $env:TEMP ("pencarimovie-runtime-" + (Get-Random))
     New-Item -ItemType Directory -Path $runtimeTmp -Force | Out-Null
     try {
-        & tar.exe -xf $archive -C $runtimeTmp --strip-components=1 2>$null
-        if ($LASTEXITCODE -ne 0) { & tar.exe -xf $archive -C $runtimeTmp 2>$null }
-        $binSource = Join-Path $runtimeTmp 'bin'
+        # Match upstream Windows packaging semantics: unpack the release into a
+        # temporary app-shaped directory first, then copy only runtime dependencies
+        # into the git checkout. Never extract the archive directly over source/UI.
+        if ($archive.EndsWith('.zip')) {
+            Expand-Archive -LiteralPath $archive -DestinationPath $runtimeTmp -Force
+        }
+        else {
+            & tar.exe -xf $archive -C $runtimeTmp --strip-components=1 2>$null
+            if ($LASTEXITCODE -ne 0) { & tar.exe -xzf $archive -C $runtimeTmp 2>$null }
+        }
+        $releaseRoot = $runtimeTmp
+        if (-not (Test-Path -LiteralPath (Join-Path $releaseRoot 'bin'))) {
+            $nested = Get-ChildItem -LiteralPath $runtimeTmp -Directory -ErrorAction SilentlyContinue |
+                Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'bin') } |
+                Select-Object -First 1
+            if ($nested) { $releaseRoot = $nested.FullName }
+        }
+        $binSource = Join-Path $releaseRoot 'bin'
         if (-not (Test-Path -LiteralPath (Join-Path $binSource 'frankenphp.exe'))) {
             throw 'The Windows release does not contain bin\\frankenphp.exe.'
         }
@@ -164,7 +179,7 @@ if ($BootstrapOnly) {
         if (-not (Test-Path -LiteralPath (Join-Path $binTarget 'frankenphp.exe'))) {
             throw 'Runtime extraction completed but bin\\frankenphp.exe is missing.'
         }
-        $vendorSource = Join-Path $runtimeTmp 'vendor'
+        $vendorSource = Join-Path $releaseRoot 'vendor'
         $vendorTarget = Join-Path $AppDir 'vendor'
         if (Test-Path -LiteralPath $vendorSource) {
             New-Item -ItemType Directory -Path $vendorTarget -Force | Out-Null
@@ -188,6 +203,9 @@ opcache.enable=0
 opcache.enable_cli=0
 '@
             Set-Content -LiteralPath $iniPath -Value $defaultIni -Encoding ASCII
+        }
+        if (-not (Test-Path -LiteralPath (Join-Path $AppDir 'bin\\frankenphp.exe'))) {
+            throw "Runtime bootstrap completed but upstream frankenphp.exe is not present at $AppDir\\bin\\frankenphp.exe."
         }
         Write-Host "Windows runtime bootstrapped into $AppDir."
         exit 0
