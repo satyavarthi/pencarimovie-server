@@ -42,11 +42,11 @@ object UpdateChecker {
     private const val TAG = "UpdateChecker"
 
     private const val VERSION_JSON_URL =
-        "https://github.com/aiskendi/pencarimovie-server/releases/download/apk-latest/version.json"
+        "https://github.com/satyavarthi/pencarimovie-server/releases/download/apk-latest/version.json"
 
     /** Where the user is sent if the direct download fails. */
     const val RELEASE_PAGE_URL =
-        "https://github.com/aiskendi/pencarimovie-server/releases/tag/apk-latest"
+        "https://github.com/satyavarthi/pencarimovie-server/releases/tag/apk-latest"
 
     /** Subdirectory of cacheDir where the APK is staged for the installer. */
     private const val UPDATE_DIR = "updates"
