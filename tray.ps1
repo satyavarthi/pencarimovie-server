@@ -352,6 +352,20 @@ function Start-AppServer {
         }
         if ($script:serverProc) {
             Write-TrayLog "frankenphp pid=$($script:serverProc.Id)"
+            Start-Sleep -Milliseconds 750
+            if ($script:serverProc.HasExited) {
+                Write-TrayLog "frankenphp exited immediately code=$($script:serverProc.ExitCode); falling back to php-server"
+                $script:serverProc = $null
+                try {
+                    $script:serverProc = Start-HiddenProcess -FileName $franken -Arguments @('php-server', '--listen', "0.0.0.0:$Port", '--root', $root)
+                    if ($script:serverProc) {
+                        Write-TrayLog "frankenphp php-server fallback pid=$($script:serverProc.Id)"
+                    }
+                }
+                catch {
+                    Write-TrayLog ("php-server fallback failed: " + $_.Exception.Message)
+                }
+            }
         }
         return
     }
