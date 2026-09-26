@@ -16,7 +16,10 @@ rem only treat a git checkout as "in place" (skip OTA).
 if exist "%~dp0backend.php" if exist "%~dp0start.bat" if exist "%~dp0.git" set "IN_PLACE=1"
 
 if "%IN_PLACE%"=="1" (
-    set "APP_DIR=%~dp0."
+    rem Use the exact current working directory for a developer checkout. This
+    rem avoids cmd.exe/%~dp0 normalization turning a trailing dot into the
+    rem parent directory when PowerShell receives -AppDir.
+    set "APP_DIR=%CD%"
 ) else (
     rem Prefer the dir resolved by the PowerShell launcher. cmd.exe mangles paths
     rem containing an apostrophe (e.g. C:\Users\test test's) when it re-derives
