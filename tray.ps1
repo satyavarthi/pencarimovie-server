@@ -348,7 +348,11 @@ function Start-AppServer {
         $stdout = Join-Path $logDir 'server.stdout.log'
         $stderr = Join-Path $logDir 'server.stderr.log'
         try {
-            $proc = Start-Process -FilePath $file -ArgumentList $arguments -WorkingDirectory $root `
+            # PowerShell 5.1 joins ArgumentList items into one command line. Quote each
+            # path-bearing argument explicitly so profiles such as "C:\Users\SONALI PANDEY"
+            # are not truncated at the first space.
+            $argLine = ConvertTo-CommandLine $arguments
+            $proc = Start-Process -FilePath $file -ArgumentList $argLine -WorkingDirectory $root `
                 -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
             Write-TrayLog "$label pid=$($proc.Id)"
             return $proc
