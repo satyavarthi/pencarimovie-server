@@ -33,7 +33,7 @@ else
 fi
 PORT="${PORT:-8088}"
 HOST="${HOST:-0.0.0.0}"
-REPO="aiskendi/pencarimovie-server"
+REPO="satyavarthi/pencarimovie-server"
 FALLBACK_TAG="v1.0.0"
 
 detect_target() {
