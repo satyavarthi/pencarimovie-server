@@ -3,7 +3,7 @@ setlocal enabledelayedexpansion
 title PencariMovie Server
 call :print_banner
 
-set "REPO=nataknutt/pencarimovie-server"
+set "REPO=satyavarthi/pencarimovie-server"
 set "FALLBACK_TAG=v1.0.0"
 set "PORT=8088"
 set "HAD_APP=0"
