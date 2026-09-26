@@ -340,7 +340,7 @@ function Start-AppServer {
         return
     }
 
-    function Start-ServerProcess([string]$file, [string[]]$args, [string]$label) {
+    function Start-ServerProcess([string]$file, [string[]]$arguments, [string]$label) {
         $logDir = Join-Path $root 'storage'
         if (-not (Test-Path -LiteralPath $logDir)) {
             New-Item -ItemType Directory -Path $logDir -Force | Out-Null
@@ -348,7 +348,7 @@ function Start-AppServer {
         $stdout = Join-Path $logDir 'server.stdout.log'
         $stderr = Join-Path $logDir 'server.stderr.log'
         try {
-            $proc = Start-Process -FilePath $file -ArgumentList $args -WorkingDirectory $root `
+            $proc = Start-Process -FilePath $file -ArgumentList $arguments -WorkingDirectory $root `
                 -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
             Write-TrayLog "$label pid=$($proc.Id)"
             return $proc
