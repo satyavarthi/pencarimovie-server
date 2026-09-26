@@ -1,6 +1,6 @@
 services:
   pencarimovie:
-    image: ghcr.io/aiskendi/pencarimovie-server:latest
+    image: ghcr.io/satyavarthi/pencarimovie-server:latest
     container_name: pencarimovie-server
     restart: unless-stopped
     ports:
