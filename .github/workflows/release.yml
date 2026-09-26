@@ -58,6 +58,39 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "$TAG" > .release-tag
 
+      - name: Prepare upstream core + custom overlay
+        run: |
+          set -euo pipefail
+          # Release artifacts must never accidentally package a forked copy of the
+          # server core. Resolve the requested release tag against upstream first;
+          # if that tag does not exist upstream, use upstream main. The repository's
+          # custom public/ UI and distribution scripts remain in this checkout.
+          UPSTREAM_REPO="https://github.com/aiskendi/pencarimovie-server.git"
+          REQUESTED_TAG="$TAG"
+          if [ "$REQUESTED_TAG" != "latest" ] && git ls-remote --exit-code --tags "$UPSTREAM_REPO" "refs/tags/$REQUESTED_TAG" >/dev/null 2>&1; then
+            UPSTREAM_REF="$REQUESTED_TAG"
+          else
+            UPSTREAM_REF="main"
+          fi
+          echo "Using upstream core ref: $UPSTREAM_REF"
+          git clone --depth 1 --branch "$UPSTREAM_REF" "$UPSTREAM_REPO" /tmp/pencarimovie-upstream
+
+          # Core/runtime files come from upstream. Keep this repository's UI,
+          # installers, updater, release scripts and distribution wrappers.
+          for path in \
+            backend.php index.php router.php Caddyfile \
+            composer.json composer.lock \
+            bin patches src docker-entrypoint.sh; do
+            if [ -e "/tmp/pencarimovie-upstream/$path" ]; then
+              rm -rf "$path"
+              cp -a "/tmp/pencarimovie-upstream/$path" "$path"
+            fi
+          done
+
+          # The custom UI is deliberately restored after the core sync.
+          git checkout -- public
+          echo "upstream-core-ref=$UPSTREAM_REF" > .upstream-core-ref
+
       - name: Setup PHP & Composer
         uses: shivammathur/setup-php@v2
         with:
