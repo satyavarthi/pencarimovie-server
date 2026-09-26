@@ -58,6 +58,18 @@ if not "%1"=="" (
 :start
 if exist "%APP_DIR%\backend.php" set "HAD_APP=1"
 call :install_or_update
+if errorlevel 1 (
+    echo.
+    echo ERROR: PencariMovie installation or runtime bootstrap failed.
+    echo The server will not be started with an incomplete runtime.
+    exit /b 1
+)
+if "%IN_PLACE%"=="1" if not exist "%APP_DIR%\bin\frankenphp.exe" (
+    echo.
+    echo ERROR: Upstream Windows runtime is missing: "%APP_DIR%\bin\frankenphp.exe"
+    echo The server will not be started until the runtime is installed correctly.
+    exit /b 1
+)
 call :register_cmd_path
 rem Enable autostart on boot by default on first run (like 9router)
 if not exist "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\PencariMovie.vbs" (
