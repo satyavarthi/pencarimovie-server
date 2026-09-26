@@ -1,0 +1,51 @@
+name: Upstream Core Sync
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync upstream core while preserving custom layer
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/aiskendi/pencarimovie-server.git
+          git fetch upstream main --tags
+
+          # These are the files owned by the upstream runtime. Do not overwrite
+          # the custom UI/distribution layer.
+          CORE_PATHS=(
+            backend.php index.php router.php Caddyfile
+            composer.json composer.lock patches
+            docker-entrypoint.sh
+          )
+
+          for path in "${CORE_PATHS[@]}"; do
+            if git cat-file -e "upstream/main:$path" 2>/dev/null; then
+              git checkout upstream/main -- "$path"
+            fi
+          done
+
+          git add "${CORE_PATHS[@]}"
+          if git diff --cached --quiet; then
+            echo "Upstream core already synchronized."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Sync upstream core from aiskendi/pencarimovie-server"
+          git push origin HEAD:main
