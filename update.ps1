@@ -155,10 +155,21 @@ if ($BootstrapOnly) {
         if (-not (Test-Path -LiteralPath (Join-Path $binSource 'frankenphp.exe'))) {
             throw 'The Windows release does not contain bin\\frankenphp.exe.'
         }
-        New-Item -ItemType Directory -Path (Join-Path $AppDir 'bin') -Force | Out-Null
-        Copy-Item -LiteralPath $binSource -Destination (Join-Path $AppDir 'bin') -Recurse -Force
+        $binTarget = Join-Path $AppDir 'bin'
+        New-Item -ItemType Directory -Path $binTarget -Force | Out-Null
+        # Copy the runtime contents into AppDir\\bin, not the bin directory itself.
+        # Copying $binSource to an already-created bin directory can create bin\\bin
+        # on Windows, leaving the launcher unable to find frankenphp.exe.
+        Copy-Item -Path (Join-Path $binSource '*') -Destination $binTarget -Recurse -Force
+        if (-not (Test-Path -LiteralPath (Join-Path $binTarget 'frankenphp.exe'))) {
+            throw 'Runtime extraction completed but bin\\frankenphp.exe is missing.'
+        }
         $vendorSource = Join-Path $runtimeTmp 'vendor'
-        if (Test-Path -LiteralPath $vendorSource) { Copy-Item -LiteralPath $vendorSource -Destination (Join-Path $AppDir 'vendor') -Recurse -Force }
+        $vendorTarget = Join-Path $AppDir 'vendor'
+        if (Test-Path -LiteralPath $vendorSource) {
+            New-Item -ItemType Directory -Path $vendorTarget -Force | Out-Null
+            Copy-Item -Path (Join-Path $vendorSource '*') -Destination $vendorTarget -Recurse -Force
+        }
         $iniPath = Join-Path $AppDir 'bin\\php.ini'
         $extDll = Join-Path $AppDir 'bin\\ext\\php_fileinfo.dll'
         if ((Test-Path -LiteralPath $extDll) -and ((-not (Test-Path -LiteralPath $iniPath)) -or ((Get-Content $iniPath -ErrorAction SilentlyContinue | Select-String -Pattern '^\\s*extension=fileinfo') -eq $null))) {
