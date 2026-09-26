@@ -57,6 +57,15 @@ function Overlay-CustomUi {
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
+if ($BootstrapOnly -and $Tag -eq 'v1.0.0') {
+    try {
+        $latest = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers @{'User-Agent'='pencarimovie-server'} -TimeoutSec 10
+        if ($latest.tag_name -match '^v[0-9]') { $Tag = $latest.tag_name }
+    } catch {
+        Write-Host "Could not resolve the latest upstream release; using $Tag."
+    }
+}
+
 $base = "https://github.com/$Repo/releases/download/$Tag"
 
 if ($OverlayOnly) {
