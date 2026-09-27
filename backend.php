@@ -7661,20 +7661,7 @@ function fd_load_catalog_settings(): array
         'catalogs_enabled' => true,
         'country' => '',
         'telegram_channel_url' => '',
-        'telegram_sources' => [
-            [
-                'id' => 'tg_02e4150bbe06bd9a',
-                'url' => 'https://t.me/public_channel_4k_2026',
-                'type' => 'public',
-                'peer' => '@public_channel_4k_2026',
-                'name' => 'public_channel_4k_2026',
-                'status' => 'pending',
-                'error' => '',
-                'added_at' => time(),
-                'last_scan_at' => 0,
-                'indexed_count' => 0,
-            ],
-        ],
+        'telegram_sources' => [],
         'enabled_types' => [
             'movie' => true,
             'series' => true,
