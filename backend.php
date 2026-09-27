@@ -2,6 +2,8 @@
 
 declare(strict_types=1);
 
+require_once __DIR__ . '/src/TelegramChannelSource.php';
+
 // Suppress PHP error output to prevent HTML warnings from breaking JSON/header responses.
 // Errors are still logged via error_log for debugging.
 ini_set('display_errors', '0');
@@ -7659,6 +7661,7 @@ function fd_load_catalog_settings(): array
         'catalogs_enabled' => true,
         'country' => '',
         'telegram_channel_url' => '',
+        'telegram_sources' => [],
         'enabled_types' => [
             'movie' => true,
             'series' => true,
@@ -7737,6 +7740,11 @@ function fd_load_catalog_settings(): array
             if (isset($data['telegram_channel_url']) && is_string($data['telegram_channel_url'])) {
                 $tg = fd_normalize_telegram_channel_url($data['telegram_channel_url']);
                 $defaults['telegram_channel_url'] = $tg['url'];
+            }
+            if (isset($data['telegram_sources']) && is_array($data['telegram_sources'])) {
+                $defaults['telegram_sources'] = array_values(array_filter($data['telegram_sources'], static function ($s) {
+                    return is_array($s) && !empty($s['id']) && !empty($s['url']);
+                }));
             }
             if (!empty($data['enabled_types']) && is_array($data['enabled_types'])) {
                 if (isset($data['enabled_types']['movie'])) {
@@ -7845,6 +7853,67 @@ function fd_load_catalog_settings(): array
 /**
  * Save catalog settings to disk.
  */
+function fd_telegram_sources(): array
+{
+    $s = fd_load_catalog_settings();
+    $rows = $s['telegram_sources'] ?? [];
+    return is_array($rows) ? array_values($rows) : [];
+}
+
+function fd_save_telegram_sources(array $sources): bool
+{
+    $s = fd_load_catalog_settings();
+    $s['telegram_sources'] = array_values($sources);
+    return fd_save_catalog_settings($s);
+}
+
+function fd_pick_telegram_source(string $sourceId): ?array
+{
+    foreach (fd_telegram_sources() as $source) {
+        if ((string)($source['id'] ?? '') === $sourceId) return $source;
+    }
+    return null;
+}
+
+function fd_telegram_source_api(string $botId = ''): array
+{
+    if ($botId === '') {
+        $picked = fd_pick_pool_bot();
+        $botId = !empty($picked['bot_id']) ? (string)$picked['bot_id'] : fd_get_bot_id();
+    }
+    if ($botId === '') {
+        throw new \RuntimeException('No active Telegram bot session is available.');
+    }
+    [$api, $error] = fd_boot_madeline(null, [], $botId);
+    if (!$api) throw new \RuntimeException($error ?: 'Could not open Telegram session.');
+    return [$api, $botId];
+}
+
+function fd_scan_telegram_source(array $source, int $maxMessages = 500): array
+{
+    [$api, $botId] = fd_telegram_source_api((string)($source['bot_id'] ?? ''));
+    try {
+        $result = TelegramChannelSource::scan($api, $source, $maxMessages);
+    } finally {
+        try { if (isset($api) && is_object($api) && method_exists($api, 'disconnect')) $api->disconnect(); } catch (\Throwable $e) {}
+    }
+
+    $source['title'] = (string)($result['title'] ?? $source['name'] ?? $source['url']);
+    $source['peer'] = (string)($result['peer'] ?? ($source['peer'] ?? ''));
+    $source['status'] = 'online';
+    $source['error'] = '';
+    $source['last_scan_at'] = time();
+    $source['indexed_count'] = count((array)($result['files'] ?? []));
+
+    $all = TelegramChannelSource::loadIndex();
+    $sourceId = (string)$source['id'];
+    $all = array_values(array_filter($all, static fn($row) => (string)($row['source_id'] ?? '') !== $sourceId));
+    foreach ((array)($result['files'] ?? []) as $row) $all[] = $row;
+    TelegramChannelSource::saveIndex($all);
+
+    return [$source, (array)($result['files'] ?? [])];
+}
+
 function fd_save_catalog_settings(array $settings): bool
 {
     $path = FD_CATALOG_SETTINGS_PATH;
@@ -13426,6 +13495,150 @@ if (str_starts_with($path, '/api/')) {
 
     if ($path === '/api/tunnel/disable' && $method === 'POST') {
         fd_json(fd_disable_tunnel());
+    }
+
+    // ── Telegram channel source manager API ─────────────────────────────
+    if ($path === '/api/telegram-sources' && $method === 'GET') {
+        $sources = fd_telegram_sources();
+        $index = TelegramChannelSource::loadIndex();
+        foreach ($sources as &$source) {
+            $sid = (string)($source['id'] ?? '');
+            $source['indexed_count'] = 0;
+            foreach ($index as $row) if ((string)($row['source_id'] ?? '') === $sid) $source['indexed_count']++;
+        }
+        unset($source);
+        fd_json(['ok'=>1,'sources'=>$sources]);
+    }
+    if ($path === '/api/telegram-sources' && $method === 'POST') {
+        $in = json_decode((string)file_get_contents('php://input'), true);
+        if (!is_array($in)) fd_json(['ok'=>0,'error'=>'Invalid JSON input'],400);
+        $action = trim((string)($in['action'] ?? 'add'));
+        $url = trim((string)($in['url'] ?? ''));
+        $sources = fd_telegram_sources();
+
+        if ($action === 'remove') {
+            $id = trim((string)($in['id'] ?? ''));
+            if ($id === '') fd_json(['ok'=>0,'error'=>'Source id is required.'],400);
+            $sources = array_values(array_filter($sources, static fn($s) => (string)($s['id'] ?? '') !== $id));
+            fd_save_telegram_sources($sources);
+            $index = TelegramChannelSource::loadIndex();
+            $index = array_values(array_filter($index, static fn($row) => (string)($row['source_id'] ?? '') !== $id));
+            TelegramChannelSource::saveIndex($index);
+            fd_json(['ok'=>1,'sources'=>$sources,'message'=>'Telegram source removed.']);
+        }
+
+        $normalized = TelegramChannelSource::normalize($url);
+        if ($normalized['url'] === '') fd_json(['ok'=>0,'error'=>'Enter a valid public channel URL or private invite link.'],400);
+        $id = TelegramChannelSource::id($normalized['url']);
+        foreach ($sources as $existing) {
+            if ((string)($existing['id'] ?? '') === $id) fd_json(['ok'=>1,'source'=>$existing,'sources'=>$sources,'message'=>'Source already exists.']);
+        }
+
+        $source = [
+            'id'=>$id,
+            'url'=>$normalized['url'],
+            'type'=>$normalized['type'],
+            'peer'=>$normalized['peer'],
+            'name'=>trim((string)($in['name'] ?? $normalized['url'])),
+            'status'=>'pending',
+            'error'=>'',
+            'added_at'=>time(),
+            'last_scan_at'=>0,
+            'indexed_count'=>0,
+        ];
+
+        if ($action === 'scan' || !empty($in['scan'])) {
+            try {
+                [$source] = fd_scan_telegram_source($source, (int)($in['max_messages'] ?? 500));
+            } catch (\Throwable $e) {
+                $source['status']='error';
+                $source['error']=$e->getMessage();
+            }
+        }
+
+        $sources[] = $source;
+        fd_save_telegram_sources($sources);
+        fd_json(['ok'=>1,'source'=>$source,'sources'=>$sources,'message'=>$source['status']==='error' ? $source['error'] : 'Telegram source added.']);
+    }
+
+    if ($path === '/api/telegram-sources/scan' && $method === 'POST') {
+        $in = json_decode((string)file_get_contents('php://input'), true);
+        $id = is_array($in) ? trim((string)($in['id'] ?? '')) : '';
+        $source = $id !== '' ? fd_pick_telegram_source($id) : null;
+        if (!$source) fd_json(['ok'=>0,'error'=>'Telegram source not found.'],404);
+        try {
+            [$updated,$files] = fd_scan_telegram_source($source, (int)($in['max_messages'] ?? 500));
+            $sources = fd_telegram_sources();
+            foreach ($sources as $k=>$s) if ((string)($s['id'] ?? '') === $id) $sources[$k]=$updated;
+            fd_save_telegram_sources($sources);
+            fd_json(['ok'=>1,'source'=>$updated,'new_files'=>count($files)]);
+        } catch (\Throwable $e) {
+            fd_json(['ok'=>0,'error'=>$e->getMessage()],502);
+        }
+    }
+
+    if ($path === '/api/telegram-channel/files' && $method === 'GET') {
+        $index = TelegramChannelSource::loadIndex();
+        $sources = fd_telegram_sources();
+        $allowed = [];
+        foreach ($sources as $s) if (($s['status'] ?? '') !== 'disabled') $allowed[(string)($s['id'] ?? '')]=true;
+        $q = trim((string)($_GET['q'] ?? ''));
+        $sourceId = trim((string)($_GET['source_id'] ?? ''));
+        $limit = max(1,min(100,(int)($_GET['limit'] ?? 30)));
+        $offset = max(0,(int)($_GET['offset'] ?? 0));
+        $rows = array_values(array_filter($index, static function($row) use($allowed,$q,$sourceId) {
+            $sid=(string)($row['source_id']??'');
+            if (!isset($allowed[$sid])) return false;
+            if ($sourceId!=='' && $sid!==$sourceId) return false;
+            if ($q!=='' && stripos((string)($row['title']??'').' '.(string)($row['caption']??''),$q)===false) return false;
+            return true;
+        }));
+        usort($rows, static fn($a,$b)=>(int)($b['date']??0)<=>(int)($a['date']??0));
+        $total=count($rows);
+        fd_json(['ok'=>1,'files'=>array_slice($rows,$offset,$limit),'total'=>$total,'offset'=>$offset,'has_more'=>($offset+$limit)<$total,'sources'=>$sources]);
+    }
+
+    if ($path === '/api/telegram-channel/stream' && ($method === 'GET' || $method === 'HEAD')) {
+        $code=trim((string)($_GET['short_code']??''));
+        if ($code==='') fd_json(['ok'=>0,'error'=>'short_code is required.'],400);
+        $row=null;
+        foreach (TelegramChannelSource::loadIndex() as $candidate) if ((string)($candidate['short_code']??'')===$code){$row=$candidate;break;}
+        if (!$row) fd_json(['ok'=>0,'error'=>'Telegram file not found.'],404);
+        if (!fd_pick_telegram_source((string)($row['source_id']??''))) fd_json(['ok'=>0,'error'=>'Telegram source has been removed.'],404);
+        [$api] = fd_telegram_source_api();
+        try {
+            $peer=(string)($row['peer']??'');
+            $messageId=(int)($row['message_id']??0);
+            $res=$api->channels->getMessages(channel:$peer,id:[$messageId]);
+            $message=$res['messages'][0]??null;
+            if (!is_array($message) || empty($message['media'])) throw new \RuntimeException('Telegram media is no longer available.');
+            $info=method_exists($api,'getDownloadInfo') ? (array)$api->getDownloadInfo($message) : [];
+            $size=(int)($info['size']??$row['file_size']??0);
+            $name=(string)($info['name']??$row['file_name']??'telegram-file');
+            $mime=(string)($info['mime']??$row['file_type']??'application/octet-stream');
+            $start=0; $end=$size>0?$size-1:null; $status=200;
+            $range=(string)($_SERVER['HTTP_RANGE']??'');
+            if ($size>0 && preg_match('/bytes=(\\d*)-(\\d*)/i',$range,$m)) {
+                $start=$m[1]!==''?(int)$m[1]:max(0,$size-(int)$m[2]);
+                $end=$m[2]!==''?min($size-1,(int)$m[2]):$size-1;
+                if($start>$end||$start>=$size) { http_response_code(416); header('Content-Range: bytes */'.$size); exit; }
+                $status=206;
+            }
+            if ($method==='HEAD') {
+                http_response_code($status); header('Content-Type: '.$mime); if($size>0) header('Content-Length: '.($end-$start+1)); header('Accept-Ranges: bytes'); if($status===206) header('Content-Range: bytes '.$start.'-'.$end.'/'.$size); exit;
+            }
+            http_response_code($status);
+            header('Content-Type: '.$mime);
+            header('Content-Disposition: inline; filename="'.str_replace(['"',"\\","\n","\r"],['_','_',' ',' '],$name).'"');
+            header('Accept-Ranges: bytes');
+            if($size>0){header('Content-Length: '.($end-$start+1));if($status===206)header('Content-Range: bytes '.$start.'-'.$end.'/'.$size);}
+            header('Cache-Control: private, max-age=0, no-store');
+            $api->downloadToStream($message, fopen('php://output','w'), null, $start, $end===null?-1:$end+1);
+            exit;
+        } catch (\Throwable $e) {
+            try { if (isset($api) && is_object($api) && method_exists($api,'disconnect')) $api->disconnect(); } catch (\Throwable $_e) {}
+            fd_json(['ok'=>0,'error'=>'Telegram stream failed: '.$e->getMessage()],502);
+        }
     }
 
     // ── Telegram channel settings API ──
