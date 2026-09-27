@@ -29,14 +29,14 @@
   --text-muted: rgba(245, 245, 247, 0.45);
 
   /* Brand */
-  --accent: #e50914;
-  --accent-hover: #ff1f2d;
+  --accent: #d6b06a;
+  --accent-hover: #e8c47a;
   --accent-prime: #2997ff;
 
   /* Semantic */
   --success: #22c55e;
   --warning: #f59e0b;
-  --danger: #ef4444;
+  --danger: #d96b6b;
 
   /* Borders */
   --border-color: #252a35;
@@ -44,7 +44,7 @@
   --border-medium: rgba(255, 255, 255, 0.14);
 
   /* Accent surfaces */
-  --accent-soft: rgba(229, 9, 20, 0.14);
+  --accent-soft: rgba(214, 176, 106, 0.14);
   --prime-soft: rgba(41, 151, 255, 0.14);
 
   /* Radius */
@@ -3223,20 +3223,6 @@ html,body{background:radial-gradient(1000px 580px at 10% -10%,rgba(139,124,255,.
 .stream-trending__pill{padding:8px 14px;border-radius:999px;background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.08);color:rgba(244,241,234,.67);flex:0 0 auto;}
 .stream-trending__pill:hover{background:rgba(214,176,106,.12);border-color:rgba(214,176,106,.34);color:#fff;transform:translateY(-1px);}
 .stream-trending__pill .trend-hot{color:var(--accent);}
-
-/* Discovery filters: a compact glass control deck that does not change data flow. */
-.pm-discovery{position:relative;z-index:8;max-width:1280px;margin:-26px auto 10px;padding:0 24px;}
-.pm-discovery__inner{display:flex;align-items:center;gap:10px 16px;flex-wrap:wrap;padding:14px;border:1px solid rgba(255,255,255,.09);border-radius:18px;background:rgba(12,16,25,.72);box-shadow:0 16px 46px rgba(0,0,0,.26);backdrop-filter:blur(20px) saturate(130%);-webkit-backdrop-filter:blur(20px) saturate(130%);}
-.pm-discovery__title{display:inline-flex;align-items:center;gap:8px;min-width:96px;color:#f4f1ea;font-size:.78rem;font-weight:800;letter-spacing:.08em;text-transform:uppercase;}
-.pm-discovery__dot{width:7px;height:7px;border-radius:50%;background:var(--accent);box-shadow:0 0 14px rgba(214,176,106,.55);}
-.pm-filter-group{display:flex;align-items:center;gap:8px;flex:1 1 auto;flex-wrap:wrap;}
-.pm-filter{display:inline-flex;align-items:center;gap:7px;min-height:36px;padding:0 9px 0 11px;border:1px solid rgba(255,255,255,.07);border-radius:11px;background:rgba(255,255,255,.035);}
-.pm-filter>span{color:rgba(244,241,234,.42);font-size:.65rem;font-weight:800;letter-spacing:.08em;text-transform:uppercase;}
-.pm-filter select{min-width:96px;border:0;outline:0;color:rgba(244,241,234,.88);background:transparent;font-size:.76rem;font-weight:650;}
-.pm-filter select option{background:#101621;color:#f4f1ea;}
-.pm-filter-clear{display:inline-flex;align-items:center;gap:7px;min-height:36px;padding:0 12px;border:1px solid rgba(214,176,106,.18);border-radius:11px;background:rgba(214,176,106,.08);color:var(--accent);font-size:.72rem;font-weight:750;}
-.pm-filter-clear:hover{background:rgba(214,176,106,.14);}
-.pm-discovery__active{flex:1 0 100%;padding:2px 3px 0;color:rgba(244,241,234,.38);font-size:.68rem;}
 
 .stream-content{max-width:1380px;padding:28px 0 90px;}
 .stream-content-row{margin-bottom:42px;padding:0 28px;contain:layout paint;}
