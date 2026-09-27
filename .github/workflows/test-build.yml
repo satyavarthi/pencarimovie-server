@@ -51,13 +51,13 @@ jobs:
 
       - name: Verify upstream-core/custom-UI separation
         run: |
-          grep -q 'REPO="aiskendi/pencarimovie-server"' pencarimovie-linux.sh
-          grep -q 'CUSTOM_REPO="satyavarthi/pencarimovie-server"' pencarimovie-linux.sh
-          grep -q 'set "REPO=aiskendi/pencarimovie-server"' pencarimovie-windows.bat
-          grep -q 'set "CUSTOM_REPO=satyavarthi/pencarimovie-server"' pencarimovie-windows.bat
-          grep -q 'CustomRepo' update.ps1
-          grep -q 'UPSTREAM_REPO=aiskendi/pencarimovie-server' Dockerfile
-          grep -q 'Overlaying repository-owned UI only' Dockerfile
+          grep -Eq 'REPO="?aiskendi/pencarimovie-server"?' pencarimovie-linux.sh
+          grep -Eq 'CUSTOM_REPO="?satyavarthi/pencarimovie-server"?' pencarimovie-linux.sh
+          grep -Eq 'set "REPO=aiskendi/pencarimovie-server"' pencarimovie-windows.bat
+          grep -Eq 'set "CUSTOM_REPO=satyavarthi/pencarimovie-server"' pencarimovie-windows.bat
+          grep -qi 'CustomRepo' update.ps1
+          grep -Eq 'ARG UPSTREAM_REPO=aiskendi/pencarimovie-server' Dockerfile
+          grep -q 'Overlaying repository-owned UI' Dockerfile
 
       - name: Test Server Boot & Manifest Response (Native PHP Mode)
         run: |
