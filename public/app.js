@@ -2781,7 +2781,29 @@ class PencariMovieApp {
       const d=await this.requestJson(this.localApiBase+'/api/telegram-user/qr');
       if(d?.logged_in){panel.innerHTML='<div class="pm-telegram-account__ok">✓ Telegram account connected.</div>';this._telegramUserLoggedIn=true;return;}
       if(d?.needs_2fa){this.$('#pmTelegram2fa')?.classList.remove('hidden');}
-      if(d?.svg && qr)qr.innerHTML=d.svg;else if(qr)qr.textContent=d?.error||'Open Telegram and scan the QR.';
+      if(qr){
+        if(d?.svg_base64){
+          const img=document.createElement('img');
+          img.alt='Telegram login QR code';
+          img.width=280; img.height=280;
+          img.src='data:image/svg+xml;base64,'+d.svg_base64;
+          img.style.display='block';
+          img.style.width='280px';
+          img.style.height='280px';
+          qr.replaceChildren(img);
+        }else if(d?.svg){
+          const img=document.createElement('img');
+          img.alt='Telegram login QR code';
+          img.width=280; img.height=280;
+          img.src='data:image/svg+xml;charset=utf-8,'+encodeURIComponent(d.svg);
+          img.style.display='block';
+          img.style.width='280px';
+          img.style.height='280px';
+          qr.replaceChildren(img);
+        }else{
+          qr.textContent=d?.error||'Telegram did not return a QR code. Please retry.';
+        }
+      }
       this.$('#pmTelegram2faBtn')?.addEventListener('click',async()=>{
         const pw=this.$('#pmTelegram2faInput')?.value||'';
         const res=await this.requestJson(this.localApiBase+'/api/telegram-user/2fa',{method:'POST',body:JSON.stringify({password:pw})});
