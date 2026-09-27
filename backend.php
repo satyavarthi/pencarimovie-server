@@ -7917,7 +7917,7 @@ function fd_telegram_source_api(string $botId = ''): array
 
 function fd_scan_telegram_source(array $source, int $maxMessages = 500): array
 {
-    [$api, $botId] = fd_telegram_source_api((string)($source['bot_id'] ?? ''));
+    [$api] = fd_telegram_user_api();
     try {
         $result = TelegramChannelSource::scan($api, $source, $maxMessages);
     } finally {
@@ -13682,7 +13682,7 @@ if (str_starts_with($path, '/api/')) {
         foreach (TelegramChannelSource::loadIndex() as $candidate) if ((string)($candidate['short_code']??'')===$code){$row=$candidate;break;}
         if (!$row) fd_json(['ok'=>0,'error'=>'Telegram file not found.'],404);
         if (!fd_pick_telegram_source((string)($row['source_id']??''))) fd_json(['ok'=>0,'error'=>'Telegram source has been removed.'],404);
-        [$api] = fd_telegram_source_api();
+        [$api] = fd_telegram_user_api();
         try {
             $peer=(string)($row['peer']??'');
             $messageId=(int)($row['message_id']??0);
