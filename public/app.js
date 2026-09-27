@@ -2747,8 +2747,14 @@ class PencariMovieApp {
         if (!track) return;
         [...track.querySelectorAll('.stream-card')].forEach(card => {
           const meta = card.querySelector('.stream-card__meta')?.textContent || '';
-          card.hidden = !((year === 'all' || new RegExp('(?:^|\\D)' + year + '(?:\\D|$)').test(meta)) &&
-            (genre === 'all' || meta.toLowerCase().includes(genre.toLowerCase())));
+          const cardCountry = (card.dataset.country || '').toUpperCase();
+          const cardYear = card.dataset.year || ((meta.match(/\\b(19|20)\\d{2}\\b/) || [])[0] || '');
+          const cardGenre = (card.dataset.genre || meta).toLowerCase();
+          const countryMatch = country === 'all' || cardCountry.split('|').map(v => v.trim()).includes(country) ||
+            (country === this._rowCountry(id) && !cardCountry);
+          card.hidden = !(countryMatch &&
+            (year === 'all' || cardYear === year) &&
+            (genre === 'all' || cardGenre.includes(genre.toLowerCase())));
         });
 
         if (sort !== 'default') {
@@ -5013,9 +5019,13 @@ class PencariMovieApp {
     const category = item.category || '';
     const year = item.year || '';
     const id = item.id || '';
+    const rawCountry = item.country || item.origin_country || item.production_country || item.production_countries || '';
+    const rawGenre = item.genre || item.genres || '';
+    const country = Array.isArray(rawCountry) ? rawCountry.map(v => typeof v === 'object' ? (v.iso_3166_1 || v.name || '') : v).join('|') : String(rawCountry);
+    const genre = Array.isArray(rawGenre) ? rawGenre.map(v => typeof v === 'object' ? (v.name || '') : v).join('|') : String(rawGenre);
 
     return `
-      <div class="stream-card" data-post-id="${id}" data-post-title="${this.escapeHtml(title)}">
+      <div class="stream-card" data-post-id="${id}" data-post-title="${this.escapeHtml(title)}" data-country="${this.escapeHtml(country)}" data-year="${this.escapeHtml(String(year))}" data-genre="${this.escapeHtml(genre)}">
         <img class="stream-card__thumb" src="${thumbnail}" alt="${this.escapeHtml(title)}" loading="lazy"
              onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%22280%22 height=%22158%22><rect fill=%22%232a2a2a%22 width=%22280%22 height=%22158%22/><text fill=%22%23808080%22 x=%22140%22 y=%2279%22 text-anchor=%22middle%22 font-size=%2214%22>${this.escapeHtml(title)}</text></svg>'">
         <div class="stream-card__overlay">
