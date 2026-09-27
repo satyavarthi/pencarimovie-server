@@ -13545,7 +13545,14 @@ if (str_starts_with($path, '/api/')) {
             [$api] = fd_telegram_user_api();
             $qr = $api->qrLogin();
             if ($qr) {
-                fd_json(['ok'=>1,'logged_in'=>false,'needs_2fa'=>false,'svg'=>$qr->getQRSvg(280,2)]);
+                $svg = (string) $qr->getQRSvg(280, 2);
+                fd_json([
+                    'ok'=>1,
+                    'logged_in'=>false,
+                    'needs_2fa'=>false,
+                    'svg'=>$svg,
+                    'svg_base64'=>base64_encode($svg),
+                ]);
             }
             $needs2fa = false;
             try { $needs2fa = $api->getAuthorization() === \danog\MadelineProto\API::WAITING_PASSWORD; } catch (\Throwable $_e) {}
