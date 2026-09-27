@@ -2711,40 +2711,61 @@ class PencariMovieApp {
   }
   _rowCountry(id){const map={malay:'MY',indonesian:'ID',korea:'KR',japan:'JP',china:'CN',thai:'TH',filipino:'PH',bollywood:'IN',english:'US'};return map[String(id).toLowerCase()]||'';}
   async _loadTelegramChannelSettings(){
-    const input=this.$('#telegramChannelInput'); if(!input) return;
-    try{const d=await this.requestJson(this.localApiBase+'/api/telegram-channel');if(d?.ok && d.url && !this.$('#telegramSourcesList')?.children.length) input.value=d.url||'';}catch(e){}
+    const input=this.$('#telegramChannelInput');
+    const saveBtn=this.$('#telegramChannelSaveBtn');
+    if(!input) return;
+
+    // Bind immediately. MadelineProto status checks can take time on first boot.
+    if(saveBtn && !saveBtn.dataset.telegramBound){
+      saveBtn.dataset.telegramBound='1';
+      saveBtn.addEventListener('click',()=>this._addTelegramSource());
+    }
+
+    try{
+      const d=await this.requestJson(this.localApiBase+'/api/telegram-channel');
+      if(d?.ok && d.url && !this.$('#telegramSourcesList')?.children.length) input.value=d.url||'';
+    }catch(e){}
     await this._loadTelegramUserAccess();
     await this._loadTelegramSources();
-    this.$('#telegramChannelSaveBtn')?.addEventListener('click',()=>this._addTelegramSource());
-  }
-
-  async _loadTelegramUserAccess(){
-    const box=this.$('#telegramSourcesList'); if(!box)return;
-    try{
-      const d=await this.requestJson(this.localApiBase+'/api/telegram-user/status');
-      if(d?.logged_in){this._telegramUserLoggedIn=true;return;}
-      this._telegramUserLoggedIn=false;
-    }catch(e){this._telegramUserLoggedIn=false;}
   }
 
   async _addTelegramSource(){
     const input=this.$('#telegramChannelInput'), status=this.$('#telegramChannelStatus');
-    const url=(input?.value||'').trim(); if(!url)return;
-    if(status)status.textContent='Checking Telegram access…';
+    const button=this.$('#telegramChannelSaveBtn');
+    const url=(input?.value||'').trim();
+    if(!url){
+      if(status)status.textContent='Enter a Telegram channel or invite link first.';
+      input?.focus();
+      return;
+    }
+    if(button){button.disabled=true;button.textContent='Checking…';}
+    if(status)status.textContent='Checking Telegram account access…';
     try{
       const access=await this.requestJson(this.localApiBase+'/api/telegram-user/status');
       if(!access?.logged_in){
-        if(status)status.textContent='Connect your Telegram account below first, then add this source.';
+        if(status)status.textContent='Telegram account access is required. Scan the QR below.';
         await this._showTelegramQr();
         return;
       }
-      const d=await this.requestJson(this.localApiBase+'/api/telegram-sources',{method:'POST',body:JSON.stringify({action:'add',url,scan:true,max_messages:1000})});
+      if(status)status.textContent='Adding source and scanning Telegram history…';
+      if(button)button.textContent='Scanning…';
+      const d=await this.requestJson(this.localApiBase+'/api/telegram-sources',{
+        method:'POST',
+        body:JSON.stringify({action:'add',url,scan:true,max_messages:1000})
+      });
       if(!d?.ok)throw new Error(d?.error||d?.message||'Could not add source');
-      if(status)status.textContent=d.source?.status==='error'?'✕ '+(d.source.error||'Scan failed'):'✓ Source added and indexed.';
-      input.value='';
+      if(status)status.textContent=d.source?.status==='error'
+        ? '✕ '+(d.source.error||'Scan failed')
+        : '✓ Source added and indexed ('+(d.source?.indexed_count||0)+' files).';
+      if(d.source?.status!=='error') input.value='';
       await this._loadTelegramSources();
       await this._loadTelegramSourceRow(true);
-    }catch(e){if(status)status.textContent='✕ '+e.message;}
+    }catch(e){
+      console.error('Telegram source add/scan failed',e);
+      if(status)status.textContent='✕ '+(e?.message||'Telegram source request failed.');
+    }finally{
+      if(button){button.disabled=false;button.textContent='Add & Scan';}
+    }
   }
 
   async _showTelegramQr(){
