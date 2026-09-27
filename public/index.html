@@ -620,17 +620,25 @@
       </section>
 
 
-      <section class="pm-discovery" id="pmDiscovery" aria-label="Discover filters"><div class="pm-discovery__inner">
-        <div class="pm-discovery__title"><span class="pm-discovery__dot"></span><span>Discover</span></div>
-        <div class="pm-filter-group">
-          <label class="pm-filter"><span>Type</span><select id="pmFilterType"><option value="all">All</option><option value="movie">Movies</option><option value="series">Series</option><option value="other">Files</option></select></label>
-          <label class="pm-filter"><span>Country</span><select id="pmFilterCountry"><option value="all">All countries</option><option value="IN">India</option><option value="US">United States</option><option value="GB">United Kingdom</option><option value="KR">Korea</option><option value="JP">Japan</option><option value="CN">China</option><option value="HK">Hong Kong</option><option value="TW">Taiwan</option><option value="TH">Thailand</option><option value="ID">Indonesia</option><option value="MY">Malaysia</option><option value="PH">Philippines</option><option value="SG">Singapore</option><option value="FR">France</option><option value="DE">Germany</option><option value="CA">Canada</option><option value="AU">Australia</option></select></label>
-          <label class="pm-filter"><span>Year</span><select id="pmFilterYear"><option value="all">All years</option></select></label>
-          <label class="pm-filter"><span>Genre</span><select id="pmFilterGenre"><option value="all">All genres</option><option value="Action">Action</option><option value="Adventure">Adventure</option><option value="Animation">Animation</option><option value="Comedy">Comedy</option><option value="Crime">Crime</option><option value="Documentary">Documentary</option><option value="Drama">Drama</option><option value="Family">Family</option><option value="Fantasy">Fantasy</option><option value="Horror">Horror</option><option value="Mystery">Mystery</option><option value="Romance">Romance</option><option value="Science Fiction">Science Fiction</option><option value="Thriller">Thriller</option></select></label>
-          <label class="pm-filter pm-filter--sort"><span>Sort</span><select id="pmFilterSort"><option value="default">Recommended</option><option value="year-desc">Newest</option><option value="year-asc">Oldest</option><option value="title-asc">A–Z</option></select></label>
-          <button type="button" class="pm-filter-clear" id="pmFilterClear"><i class="fas fa-rotate-left"></i><span>Clear</span></button>
-        </div><div class="pm-discovery__active" id="pmFilterSummary">Showing everything</div>
-      </div></section>
+      <section class="pm-discovery" id="pmDiscovery" aria-label="Catalog controls">
+        <div class="pm-discovery__bar">
+          <button type="button" class="pm-filter-trigger" id="pmFilterTrigger" aria-expanded="false" aria-controls="pmFilterPanel">
+            <i class="fas fa-sliders" aria-hidden="true"></i><span>Filters</span><span class="pm-filter-trigger__count hidden" id="pmFilterCount">0</span>
+          </button>
+          <div class="pm-discovery__active" id="pmFilterSummary">All titles</div>
+          <button type="button" class="pm-filter-clear pm-filter-clear--bar hidden" id="pmFilterClear"><i class="fas fa-rotate-left"></i><span>Reset</span></button>
+        </div>
+        <div class="pm-filter-panel hidden" id="pmFilterPanel" aria-hidden="true">
+          <div class="pm-filter-panel__head"><div><strong>Refine your library</strong><span>Choose only what matters</span></div><button type="button" class="pm-filter-panel__close" id="pmFilterClose" aria-label="Close filters">×</button></div>
+          <div class="pm-filter-group">
+            <label class="pm-filter"><span>Type</span><select id="pmFilterType"><option value="all">All</option><option value="movie">Movies</option><option value="series">Series</option><option value="other">Files</option></select></label>
+            <label class="pm-filter"><span>Country</span><select id="pmFilterCountry"><option value="all">All countries</option><option value="IN">India</option><option value="US">United States</option><option value="GB">United Kingdom</option><option value="KR">Korea</option><option value="JP">Japan</option><option value="CN">China</option><option value="HK">Hong Kong</option><option value="TW">Taiwan</option><option value="TH">Thailand</option><option value="ID">Indonesia</option><option value="MY">Malaysia</option><option value="PH">Philippines</option><option value="SG">Singapore</option><option value="FR">France</option><option value="DE">Germany</option><option value="CA">Canada</option><option value="AU">Australia</option></select></label>
+            <label class="pm-filter"><span>Year</span><select id="pmFilterYear"><option value="all">All years</option></select></label>
+            <label class="pm-filter"><span>Genre</span><select id="pmFilterGenre"><option value="all">All genres</option><option value="Action">Action</option><option value="Adventure">Adventure</option><option value="Animation">Animation</option><option value="Comedy">Comedy</option><option value="Crime">Crime</option><option value="Documentary">Documentary</option><option value="Drama">Drama</option><option value="Family">Family</option><option value="Fantasy">Fantasy</option><option value="Horror">Horror</option><option value="Mystery">Mystery</option><option value="Romance">Romance</option><option value="Science Fiction">Science Fiction</option><option value="Thriller">Thriller</option></select></label>
+            <label class="pm-filter pm-filter--sort"><span>Sort</span><select id="pmFilterSort"><option value="default">Recommended</option><option value="year-desc">Newest</option><option value="year-asc">Oldest</option><option value="title-asc">A–Z</option></select></label>
+          </div>
+        </div>
+      </section>
       <main class="stream-content" id="streamContent"></main>
 
       <!-- Loading Spinner -->
