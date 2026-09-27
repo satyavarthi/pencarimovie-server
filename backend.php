@@ -13654,6 +13654,17 @@ if (str_starts_with($path, '/api/')) {
         }
     }
 
+    if ($path === '/api/telegram-channel/file' && $method === 'GET') {
+        $code=trim((string)($_GET['short_code']??''));
+        $found=null;
+        foreach (TelegramChannelSource::loadIndex() as $row) if ((string)($row['short_code']??'')===$code){$found=$row;break;}
+        if(!$found || !fd_pick_telegram_source((string)($found['source_id']??''))) fd_json(['ok'=>0,'error'=>'Telegram file not found.'],404);
+        $found['ok']=1;
+        $found['play_url']='/api/telegram-channel/stream?short_code='.rawurlencode($code);
+        $found['file_type']=$found['file_type']??'application/octet-stream';
+        fd_json($found);
+    }
+
     if ($path === '/api/telegram-channel/files' && $method === 'GET') {
         $index = TelegramChannelSource::loadIndex();
         $sources = fd_telegram_sources();
