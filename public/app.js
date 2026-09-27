@@ -14,7 +14,7 @@ class PencariMovieApp {
     this.localApiBase = window.location.origin;
     this.wpApiBase = 'https://pencarimovie.com/wp-json/pencarimovie-server/v1';
     this.wpAjaxUrl = 'https://pencarimovie.com/wp-admin/admin-ajax.php';
-    this.siteName = 'PencariMovie';
+    this.siteName = "Director" + String.fromCharCode(39) + "s Cut";
 
     // ── State ──
     this.categories = [];

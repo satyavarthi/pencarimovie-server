@@ -6,8 +6,8 @@
       name="viewport"
       content="width=device-width, initial-scale=1.0, viewport-fit=cover"
     />
-    <meta name="theme-color" content="#141414" />
-    <title>PencariMovie — Stream & Download</title>
+    <meta name="theme-color" content="#090B12" />
+    <title>Director's Cut — Your Cinema, Your Cut</title>
     <link rel="stylesheet" href="stream-theme.css" />
     <link rel="stylesheet" href="styles.css" />
     <link
@@ -21,7 +21,7 @@
     <!-- ─── Loading Screen (shown during session check) ───────── -->
     <div id="loadingScreen" class="loading-screen" aria-hidden="false">
       <div class="loading-screen__spinner"></div>
-      <p class="loading-screen__text">Connecting...</p>
+      <p class="loading-screen__text">Opening your screening room</p>
     </div>
     <script>
       // Immediately open configure / settings modal without waiting for scripts or network ONLY if session exists
@@ -73,7 +73,7 @@
         <h2 class="update-required__title">Update Required</h2>
         <p class="update-required__desc">
           Your app version is outdated. Please update to continue using
-          PencariMovie Downloader.
+          Director's Cut Downloader.
         </p>
         <div class="update-required__details">
           <span
@@ -99,7 +99,7 @@
     <div id="fatalErrorOverlay" class="fatal-error hidden" aria-hidden="true">
       <div class="fatal-error__card">
         <div class="fatal-error__icon">&#x26A0;&#xFE0F;</div>
-        <h2 class="fatal-error__title">PencariMovie Server cannot start</h2>
+        <h2 class="fatal-error__title">Director's Cut Server cannot start</h2>
         <p class="fatal-error__desc">
           The server is missing a required component or is running on an
           unsupported platform. Entering a bot token will not fix this.
@@ -113,7 +113,7 @@
     <!-- ─── Auth Gate (server password) ────────────────────────── -->
     <div id="authGate" class="settings-gate hidden" aria-hidden="true">
       <div class="settings-gate__card">
-        <h2 class="settings-gate__title">🔒 PencariMovie Server</h2>
+        <h2 class="settings-gate__title">🔒 Director's Cut Server</h2>
         <p class="settings-gate__desc">
           Enter server password to continue. (Default: <code>123456</code>)
         </p>
@@ -145,7 +145,7 @@
             text-align: left;
           "
         >
-          PencariMovie Server is completely free &mdash; we never sell access or
+          Director's Cut Server is completely free &mdash; we never sell access or
           subscriptions. If this is not your personal server, you can easily run
           your own for free on your phone, PC, or TV &mdash; get the installer
           at
@@ -363,7 +363,7 @@
 
           <div class="settings-gate__addon-box pm-telegram-settings" style="margin-top:14px">
             <div class="pm-settings-heading"><span>📣 Telegram Sources</span><span class="pm-settings-badge">Live</span></div>
-            <p class="settings-gate__tunnel-desc">Add public channels or private invite links. PencariMovie indexes their media and streams directly from Telegram. Remove a source to immediately hide its files.</p>
+            <p class="settings-gate__tunnel-desc">Add public channels or private invite links. Director's Cut indexes their media and streams directly from Telegram. Remove a source to immediately hide its files.</p>
             <div class="pm-telegram-row">
               <input type="url" id="telegramChannelInput" class="settings-gate__input" placeholder="https://t.me/yourchannel or https://t.me/+invite..." autocomplete="off" spellcheck="false" />
               <button type="button" id="telegramChannelSaveBtn" class="settings-gate__btn">Add & Scan</button>
@@ -558,7 +558,7 @@
       <!-- NavBar -->
       <nav class="stream-nav" id="streamNav">
         <div class="stream-nav__inner">
-          <a class="stream-nav__logo" href="/">PencariMovie</a>
+          <a class="stream-nav__logo dc-brand" href="/" aria-label="Director's Cut home"><img class="dc-brand__mark" src="director-cut-logo.svg" alt="" width="34" height="34" decoding="async" /><span class="dc-brand__wordmark"><span>DIRECTOR'S</span><strong>CUT</strong></span></a>
           <div class="stream-nav__links" id="streamNavLinks"></div>
           <div class="stream-nav__actions">
             <span id="botStatusBadge" class="bot-status">○ Disconnected</span>
@@ -1121,7 +1121,7 @@
                 checked
               />
               <div class="addon-catalog-mode-opt__info">
-                <strong>PencariMovie Catalogs: Enabled</strong>
+                <strong>Director's Cut Catalogs: Enabled</strong>
                 <span
                   >Local home rows + Country/Genre catalogs (Movies, Series,
                   Telegram Files)</span
@@ -1136,7 +1136,7 @@
                 value="disabled"
               />
               <div class="addon-catalog-mode-opt__info">
-                <strong>PencariMovie Catalogs: Disabled</strong>
+                <strong>Director's Cut Catalogs: Disabled</strong>
                 <span
                   >Hide local home rows (Upstream bridged addons and Streams
                   remain active)</span
@@ -1277,7 +1277,7 @@
             >
               Add external addon manifest URLs (AIOStreams, Torrentio,
               OpenSubtitles, etc.). Their catalogs, metadata, streams, and
-              subtitles are automatically bridged into your single PencariMovie
+              subtitles are automatically bridged into your single Director's Cut
               address.
             </p>
             <div
