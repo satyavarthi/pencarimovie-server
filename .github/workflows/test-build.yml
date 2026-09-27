@@ -53,8 +53,8 @@ jobs:
         run: |
           grep -q 'REPO="aiskendi/pencarimovie-server"' pencarimovie-linux.sh
           grep -q 'CUSTOM_REPO="satyavarthi/pencarimovie-server"' pencarimovie-linux.sh
-          grep -q 'REPO=aiskendi/pencarimovie-server' pencarimovie-windows.bat
-          grep -q 'CUSTOM_REPO=satyavarthi/pencarimovie-server' pencarimovie-windows.bat
+          grep -q 'set "REPO=aiskendi/pencarimovie-server"' pencarimovie-windows.bat
+          grep -q 'set "CUSTOM_REPO=satyavarthi/pencarimovie-server"' pencarimovie-windows.bat
           grep -q 'CustomRepo' update.ps1
           grep -q 'UPSTREAM_REPO=aiskendi/pencarimovie-server' Dockerfile
           grep -q 'Overlaying repository-owned UI only' Dockerfile
