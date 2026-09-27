@@ -4844,6 +4844,8 @@ class PencariMovieApp {
       const batch = this.categories.slice(i, i + batchSize);
       await Promise.all(batch.map(cat => loadCategory(cat)));
     }
+
+    await this._loadTelegramSourceRow();
   }
 
   _buildTrackHtml(trackId, title, items) {
