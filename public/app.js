@@ -2705,9 +2705,95 @@ class PencariMovieApp {
   }
 
   _initDiscoveryFilters() {
-    const ids=['pmFilterType','pmFilterCountry','pmFilterYear','pmFilterGenre','pmFilterSort'], els=Object.fromEntries(ids.map(id=>[id,this.$('#'+id)])); if(!els.pmFilterType)return;
-    for(let y=new Date().getFullYear();y>=1950;y--){const o=document.createElement('option');o.value=String(y);o.textContent=String(y);els.pmFilterYear.appendChild(o);}
-    const apply=()=>{const type=els.pmFilterType.value,country=els.pmFilterCountry.value,year=els.pmFilterYear.value,genre=els.pmFilterGenre.value,sort=els.pmFilterSort.value;document.querySelectorAll('#streamContent .stream-content-row').forEach(row=>{const id=(row.id||'').replace(/^row-/,'');const title=row.querySelector('.stream-content-row__title')?.textContent||'';const tm=type==='all'||(type==='movie'&&/movie/i.test(title))||(type==='series'&&/series|k-drama|j-drama|anime series/i.test(title))||(type==='other'&&/telegram|file/i.test(title));row.hidden=!(tm&&(country==='all'||this._rowCountry(id)===country));const track=row.querySelector('.stream-content-row__track');if(!track)return;[...track.querySelectorAll('.stream-card')].forEach(card=>{const meta=card.querySelector('.stream-card__meta')?.textContent||'';card.hidden=!((year==='all'||new RegExp('(?:^|\\D)'+year+'(?:\\D|$)').test(meta))&&(genre==='all'||meta.toLowerCase().includes(genre.toLowerCase())));});if(sort!=='default'){const cards=[...track.children].filter(c=>!c.hidden);cards.sort((a,b)=>{const ma=a.querySelector('.stream-card__meta')?.textContent||'',mb=b.querySelector('.stream-card__meta')?.textContent||'',ya=parseInt((ma.match(/\\b(19|20)\\d{2}\\b/)||[])[0]||'0'),yb=parseInt((mb.match(/\\b(19|20)\\d{2}\\b/)||[])[0]||'0');return sort==='title-asc'?(a.querySelector('.stream-card__title')?.textContent||'').localeCompare(b.querySelector('.stream-card__title')?.textContent||''):sort==='year-asc'?ya-yb:yb-ya;});cards.forEach(c=>track.appendChild(c));}});const sum=[];if(type!=='all')sum.push(type==='movie'?'Movies':type==='series'?'Series':'Files');if(country!=='all')sum.push(els.pmFilterCountry.options[els.pmFilterCountry.selectedIndex].text);if(year!=='all')sum.push(year);if(genre!=='all')sum.push(genre);if(sort!=='default')sum.push(els.pmFilterSort.options[els.pmFilterSort.selectedIndex].text);this.$('#pmFilterSummary').textContent=sum.length?sum.join(' · '):'Showing everything';}; ids.forEach(id=>els[id]?.addEventListener('change',apply));this.$('#pmFilterClear')?.addEventListener('click',()=>{ids.forEach(id=>{if(els[id])els[id].value=id==='pmFilterSort'?'default':'all';});apply();});this._applyDiscoveryFilters=apply;
+    const ids = ['pmFilterType','pmFilterCountry','pmFilterYear','pmFilterGenre','pmFilterSort'];
+    const els = Object.fromEntries(ids.map(id => [id, this.$('#' + id)]));
+    const panel = this.$('#pmFilterPanel');
+    const trigger = this.$('#pmFilterTrigger');
+    const close = this.$('#pmFilterClose');
+    const clear = this.$('#pmFilterClear');
+    const count = this.$('#pmFilterCount');
+    if (!els.pmFilterType) return;
+
+    for (let y = new Date().getFullYear(); y >= 1950; y--) {
+      const o = document.createElement('option');
+      o.value = String(y);
+      o.textContent = String(y);
+      els.pmFilterYear.appendChild(o);
+    }
+
+    const setOpen = (open) => {
+      panel?.classList.toggle('hidden', !open);
+      panel?.setAttribute('aria-hidden', String(!open));
+      trigger?.setAttribute('aria-expanded', String(open));
+      document.body.classList.toggle('pm-filter-open', open);
+    };
+
+    const apply = () => {
+      const type = els.pmFilterType.value;
+      const country = els.pmFilterCountry.value;
+      const year = els.pmFilterYear.value;
+      const genre = els.pmFilterGenre.value;
+      const sort = els.pmFilterSort.value;
+
+      document.querySelectorAll('#streamContent .stream-content-row').forEach(row => {
+        const id = (row.id || '').replace(/^row-/, '');
+        const title = row.querySelector('.stream-content-row__title')?.textContent || '';
+        const typeMatch = type === 'all' || (type === 'movie' && /movie/i.test(title)) ||
+          (type === 'series' && /series|k-drama|j-drama|anime series/i.test(title)) ||
+          (type === 'other' && /telegram|file/i.test(title));
+        row.hidden = !(typeMatch && (country === 'all' || this._rowCountry(id) === country));
+
+        const track = row.querySelector('.stream-content-row__track');
+        if (!track) return;
+        [...track.querySelectorAll('.stream-card')].forEach(card => {
+          const meta = card.querySelector('.stream-card__meta')?.textContent || '';
+          card.hidden = !((year === 'all' || new RegExp('(?:^|\\D)' + year + '(?:\\D|$)').test(meta)) &&
+            (genre === 'all' || meta.toLowerCase().includes(genre.toLowerCase())));
+        });
+
+        if (sort !== 'default') {
+          const cards = [...track.children].filter(card => !card.hidden);
+          cards.sort((a, b) => {
+            const ma = a.querySelector('.stream-card__meta')?.textContent || '';
+            const mb = b.querySelector('.stream-card__meta')?.textContent || '';
+            const ya = parseInt((ma.match(/\\b(19|20)\\d{2}\\b/) || [])[0] || '0');
+            const yb = parseInt((mb.match(/\\b(19|20)\\d{2}\\b/) || [])[0] || '0');
+            if (sort === 'title-asc') return (a.querySelector('.stream-card__title')?.textContent || '').localeCompare(b.querySelector('.stream-card__title')?.textContent || '');
+            return sort === 'year-asc' ? ya - yb : yb - ya;
+          });
+          cards.forEach(card => track.appendChild(card));
+        }
+      });
+
+      const active = [];
+      if (type !== 'all') active.push(type === 'movie' ? 'Movies' : type === 'series' ? 'Series' : 'Files');
+      if (country !== 'all') active.push(els.pmFilterCountry.options[els.pmFilterCountry.selectedIndex].text);
+      if (year !== 'all') active.push(year);
+      if (genre !== 'all') active.push(genre);
+      if (sort !== 'default') active.push(els.pmFilterSort.options[els.pmFilterSort.selectedIndex].text);
+
+      const hasFilters = active.length > 0;
+      const summary = this.$('#pmFilterSummary');
+      if (summary) summary.textContent = hasFilters ? active.join(' · ') : 'All titles';
+      count?.classList.toggle('hidden', !hasFilters);
+      if (count) count.textContent = String(active.length);
+      clear?.classList.toggle('hidden', !hasFilters);
+    };
+
+    ids.forEach(id => els[id]?.addEventListener('change', apply));
+    trigger?.addEventListener('click', () => setOpen(panel?.classList.contains('hidden')));
+    close?.addEventListener('click', () => setOpen(false));
+    clear?.addEventListener('click', () => {
+      ids.forEach(id => { if (els[id]) els[id].value = id === 'pmFilterSort' ? 'default' : 'all'; });
+      apply();
+      setOpen(false);
+    });
+
+    panel?.addEventListener('click', (event) => {
+      if (event.target === panel) setOpen(false);
+    });
+
+    this._applyDiscoveryFilters = apply;
   }
   _rowCountry(id){const map={malay:'MY',indonesian:'ID',korea:'KR',japan:'JP',china:'CN',thai:'TH',filipino:'PH',bollywood:'IN',english:'US'};return map[String(id).toLowerCase()]||'';}
   async _loadTelegramChannelSettings(){
