@@ -7646,6 +7646,13 @@ function fd_get_trending_keywords_map(): array
  *   'enabled_catalogs' => ['pm_movies_latest' => true, ...]
  * ]
  */
+function fd_normalize_telegram_channel_url(string $url): array
+{
+    $url=trim($url); if($url==='') return ['url'=>'','type'=>''];
+    if(!preg_match('#^https?://t\.me/(?:\+|joinchat/|[A-Za-z0-9_]{4,})#i',$url)) return ['url'=>'','type'=>''];
+    return ['url'=>$url,'type'=>(preg_match('#/\+|/joinchat/#i',$url)?'private':'public')];
+}
+
 function fd_load_catalog_settings(): array
 {
     $defaults = [
@@ -13415,6 +13422,10 @@ if (str_starts_with($path, '/api/')) {
     if ($path === '/api/tunnel/disable' && $method === 'POST') {
         fd_json(fd_disable_tunnel());
     }
+
+    // ── Telegram channel settings API ──
+    if($path==='/api/telegram-channel' && $method==='GET'){ $s=fd_load_catalog_settings(); $tg=fd_normalize_telegram_channel_url((string)($s['telegram_channel_url']??'')); fd_json(['ok'=>1,'url'=>$tg['url'],'type'=>$tg['type']]); }
+    if($path==='/api/telegram-channel' && $method==='POST'){ $in=json_decode((string)file_get_contents('php://input'),true); if(!is_array($in)) fd_json(['ok'=>0,'error'=>'Invalid JSON input'],400); $tg=fd_normalize_telegram_channel_url((string)($in['url']??'')); if(($in['url']??'')!==''&&$tg['url']==='') fd_json(['ok'=>0,'error'=>'Enter a valid Telegram public channel or private invite link.'],400); $s=fd_load_catalog_settings(); $s['telegram_channel_url']=$tg['url']; $saved=fd_save_catalog_settings($s); fd_json(['ok'=>$saved?1:0,'url'=>$tg['url'],'type'=>$tg['type'],'message'=>$saved?'Telegram channel saved.':'Could not save Telegram channel.'],$saved?200:500); }
 
     // ── Catalog settings API ──
     if ($path === '/api/catalog-settings' && $method === 'GET') {
