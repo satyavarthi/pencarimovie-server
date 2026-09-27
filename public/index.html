@@ -361,7 +361,16 @@
             </button>
           </div>
 
-          <div class="settings-gate__addon-box pm-telegram-settings" style="margin-top:14px"><div class="pm-settings-heading"><span>📣 Telegram Channel</span><span class="pm-settings-badge">Optional</span></div><p class="settings-gate__tunnel-desc">Public channels and private invite links are supported.</p><div class="pm-telegram-row"><input type="url" id="telegramChannelInput" class="settings-gate__input" placeholder="https://t.me/yourchannel or https://t.me/+invite..." autocomplete="off" spellcheck="false" /><button type="button" id="telegramChannelSaveBtn" class="settings-gate__btn">Save</button></div><div id="telegramChannelStatus" class="settings-gate__status" style="margin:6px 0 0"></div></div>
+          <div class="settings-gate__addon-box pm-telegram-settings" style="margin-top:14px">
+            <div class="pm-settings-heading"><span>📣 Telegram Sources</span><span class="pm-settings-badge">Live</span></div>
+            <p class="settings-gate__tunnel-desc">Add public channels or private invite links. PencariMovie indexes their media and streams directly from Telegram. Remove a source to immediately hide its files.</p>
+            <div class="pm-telegram-row">
+              <input type="url" id="telegramChannelInput" class="settings-gate__input" placeholder="https://t.me/yourchannel or https://t.me/+invite..." autocomplete="off" spellcheck="false" />
+              <button type="button" id="telegramChannelSaveBtn" class="settings-gate__btn">Add & Scan</button>
+            </div>
+            <div id="telegramChannelStatus" class="settings-gate__status" style="margin:6px 0 0"></div>
+            <div id="telegramSourcesList" class="pm-telegram-sources"></div>
+          </div>
           <!-- Change Password Box -->
           <div class="settings-gate__addon-box" style="margin-top: 14px">
             <span>🔑 Change Password</span>
