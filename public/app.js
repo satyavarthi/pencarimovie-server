@@ -2710,7 +2710,99 @@ class PencariMovieApp {
     const apply=()=>{const type=els.pmFilterType.value,country=els.pmFilterCountry.value,year=els.pmFilterYear.value,genre=els.pmFilterGenre.value,sort=els.pmFilterSort.value;document.querySelectorAll('#streamContent .stream-content-row').forEach(row=>{const id=(row.id||'').replace(/^row-/,'');const title=row.querySelector('.stream-content-row__title')?.textContent||'';const tm=type==='all'||(type==='movie'&&/movie/i.test(title))||(type==='series'&&/series|k-drama|j-drama|anime series/i.test(title))||(type==='other'&&/telegram|file/i.test(title));row.hidden=!(tm&&(country==='all'||this._rowCountry(id)===country));const track=row.querySelector('.stream-content-row__track');if(!track)return;[...track.querySelectorAll('.stream-card')].forEach(card=>{const meta=card.querySelector('.stream-card__meta')?.textContent||'';card.hidden=!((year==='all'||new RegExp('(?:^|\\D)'+year+'(?:\\D|$)').test(meta))&&(genre==='all'||meta.toLowerCase().includes(genre.toLowerCase())));});if(sort!=='default'){const cards=[...track.children].filter(c=>!c.hidden);cards.sort((a,b)=>{const ma=a.querySelector('.stream-card__meta')?.textContent||'',mb=b.querySelector('.stream-card__meta')?.textContent||'',ya=parseInt((ma.match(/\\b(19|20)\\d{2}\\b/)||[])[0]||'0'),yb=parseInt((mb.match(/\\b(19|20)\\d{2}\\b/)||[])[0]||'0');return sort==='title-asc'?(a.querySelector('.stream-card__title')?.textContent||'').localeCompare(b.querySelector('.stream-card__title')?.textContent||''):sort==='year-asc'?ya-yb:yb-ya;});cards.forEach(c=>track.appendChild(c));}});const sum=[];if(type!=='all')sum.push(type==='movie'?'Movies':type==='series'?'Series':'Files');if(country!=='all')sum.push(els.pmFilterCountry.options[els.pmFilterCountry.selectedIndex].text);if(year!=='all')sum.push(year);if(genre!=='all')sum.push(genre);if(sort!=='default')sum.push(els.pmFilterSort.options[els.pmFilterSort.selectedIndex].text);this.$('#pmFilterSummary').textContent=sum.length?sum.join(' · '):'Showing everything';}; ids.forEach(id=>els[id]?.addEventListener('change',apply));this.$('#pmFilterClear')?.addEventListener('click',()=>{ids.forEach(id=>{if(els[id])els[id].value=id==='pmFilterSort'?'default':'all';});apply();});this._applyDiscoveryFilters=apply;
   }
   _rowCountry(id){const map={malay:'MY',indonesian:'ID',korea:'KR',japan:'JP',china:'CN',thai:'TH',filipino:'PH',bollywood:'IN',english:'US'};return map[String(id).toLowerCase()]||'';}
-  async _loadTelegramChannelSettings(){const input=this.$('#telegramChannelInput');if(!input)return;try{const d=await this.requestJson(this.localApiBase+'/api/telegram-channel');if(d?.ok)input.value=d.url||'';}catch(e){}this.$('#telegramChannelSaveBtn')?.addEventListener('click',async()=>{const status=this.$('#telegramChannelStatus'),url=input.value.trim();if(status)status.textContent='Saving…';try{const d=await this.requestJson(this.localApiBase+'/api/telegram-channel',{method:'POST',body:JSON.stringify({url})});if(!d?.ok)throw new Error(d?.error||d?.message||'Could not save');if(status)status.textContent=d.url?'Saved ('+d.type+')':'Channel link cleared';}catch(e){if(status)status.textContent='✕ '+e.message;}});}
+  async _loadTelegramChannelSettings(){
+    const input=this.$('#telegramChannelInput'); if(!input) return;
+    try{const d=await this.requestJson(this.localApiBase+'/api/telegram-channel');if(d?.ok && d.url && !this.$('#telegramSourcesList')?.children.length) input.value=d.url||'';}catch(e){}
+    await this._loadTelegramUserAccess();
+    await this._loadTelegramSources();
+    this.$('#telegramChannelSaveBtn')?.addEventListener('click',()=>this._addTelegramSource());
+  }
+
+  async _loadTelegramUserAccess(){
+    const box=this.$('#telegramSourcesList'); if(!box)return;
+    try{
+      const d=await this.requestJson(this.localApiBase+'/api/telegram-user/status');
+      if(d?.logged_in){this._telegramUserLoggedIn=true;return;}
+      this._telegramUserLoggedIn=false;
+    }catch(e){this._telegramUserLoggedIn=false;}
+  }
+
+  async _addTelegramSource(){
+    const input=this.$('#telegramChannelInput'), status=this.$('#telegramChannelStatus');
+    const url=(input?.value||'').trim(); if(!url)return;
+    if(status)status.textContent='Checking Telegram access…';
+    try{
+      const access=await this.requestJson(this.localApiBase+'/api/telegram-user/status');
+      if(!access?.logged_in){
+        if(status)status.textContent='Connect your Telegram account below first, then add this source.';
+        await this._showTelegramQr();
+        return;
+      }
+      const d=await this.requestJson(this.localApiBase+'/api/telegram-sources',{method:'POST',body:JSON.stringify({action:'add',url,scan:true,max_messages:1000})});
+      if(!d?.ok)throw new Error(d?.error||d?.message||'Could not add source');
+      if(status)status.textContent=d.source?.status==='error'?'✕ '+(d.source.error||'Scan failed'):'✓ Source added and indexed.';
+      input.value='';
+      await this._loadTelegramSources();
+      await this._loadTelegramSourceRow(true);
+    }catch(e){if(status)status.textContent='✕ '+e.message;}
+  }
+
+  async _showTelegramQr(){
+    const list=this.$('#telegramSourcesList'); if(!list)return;
+    let panel=this.$('#pmTelegramAccountPanel');
+    if(!panel){
+      panel=document.createElement('div'); panel.id='pmTelegramAccountPanel'; panel.className='pm-telegram-account';
+      list.prepend(panel);
+    }
+    panel.innerHTML='<div class="pm-telegram-account__title">🔐 Telegram account access</div><div class="pm-telegram-account__desc">Scan this QR with Telegram. This is a separate read-only session used for channel history and private channels; your existing bot login is unchanged.</div><div class="pm-telegram-qr" id="pmTelegramQr">Loading QR…</div><div class="pm-telegram-2fa hidden" id="pmTelegram2fa"><input id="pmTelegram2faInput" type="password" placeholder="Telegram 2FA password" class="settings-gate__input"><button id="pmTelegram2faBtn" class="settings-gate__btn">Unlock</button></div>';
+    const qr=this.$('#pmTelegramQr');
+    try{
+      const d=await this.requestJson(this.localApiBase+'/api/telegram-user/qr');
+      if(d?.logged_in){panel.innerHTML='<div class="pm-telegram-account__ok">✓ Telegram account connected.</div>';this._telegramUserLoggedIn=true;return;}
+      if(d?.needs_2fa){this.$('#pmTelegram2fa')?.classList.remove('hidden');}
+      if(d?.svg && qr)qr.innerHTML=d.svg;else if(qr)qr.textContent=d?.error||'Open Telegram and scan the QR.';
+      this.$('#pmTelegram2faBtn')?.addEventListener('click',async()=>{
+        const pw=this.$('#pmTelegram2faInput')?.value||'';
+        const res=await this.requestJson(this.localApiBase+'/api/telegram-user/2fa',{method:'POST',body:JSON.stringify({password:pw})});
+        if(res?.ok){this._telegramUserLoggedIn=true;panel.innerHTML='<div class="pm-telegram-account__ok">✓ Telegram account connected.</div>';}else alert(res?.error||'2FA failed');
+      });
+    }catch(e){if(qr)qr.textContent='QR unavailable: '+e.message;}
+  }
+
+  async _loadTelegramSources(){
+    const list=this.$('#telegramSourcesList'); if(!list)return;
+    try{
+      const d=await this.requestJson(this.localApiBase+'/api/telegram-sources');
+      const sources=Array.isArray(d?.sources)?d.sources:[];
+      list.querySelectorAll('.pm-telegram-account,.pm-telegram-source').forEach(el=>el.remove());
+      if(!this._telegramUserLoggedIn){
+        const panel=document.createElement('div');panel.className='pm-telegram-account';
+        panel.innerHTML='<div class="pm-telegram-account__title">🔐 Telegram account access required</div><div class="pm-telegram-account__desc">One-time QR login is required to read channel history. Your existing PencariMovie bot session is not changed.</div><button class="settings-gate__btn pm-telegram-connect">Connect Telegram Account</button>';
+        list.prepend(panel);panel.querySelector('.pm-telegram-connect')?.addEventListener('click',()=>this._showTelegramQr());
+      }
+      sources.forEach(s=>{
+        const el=document.createElement('div');el.className='pm-telegram-source';
+        const status=s.status==='error'?'error':(s.status==='online'?'online':'pending');
+        el.innerHTML='<div class="pm-telegram-source__main"><strong>'+this.escapeHtml(s.title||s.url)+'</strong><span>'+this.escapeHtml(s.type||'source')+' · '+Number(s.indexed_count||0)+' files</span></div><div class="pm-telegram-source__actions"><button data-scan>↻</button><button data-remove>Remove</button></div><div class="pm-telegram-source__status '+status+'">'+this.escapeHtml(s.error||'Ready')+'</div>';
+        el.querySelector('[data-scan]')?.addEventListener('click',async()=>{el.querySelector('[data-scan]').disabled=true;try{const x=await this.requestJson(this.localApiBase+'/api/telegram-sources/scan',{method:'POST',body:JSON.stringify({id:s.id,max_messages:1000})});if(x?.ok)await this._loadTelegramSources();else alert(x?.error||'Scan failed');}catch(e){alert(e.message)}});
+        el.querySelector('[data-remove]')?.addEventListener('click',async()=>{if(!confirm('Remove this Telegram source and hide all of its indexed files?'))return;await this.requestJson(this.localApiBase+'/api/telegram-sources',{method:'POST',body:JSON.stringify({action:'remove',id:s.id})});await this._loadTelegramSources();await this._loadTelegramSourceRow(true);});
+        list.appendChild(el);
+      });
+    }catch(e){list.insertAdjacentHTML('beforeend','<div class="pm-telegram-source__status error">'+this.escapeHtml(e.message)+'</div>');}
+  }
+
+  async _loadTelegramSourceRow(refresh=false){
+    const container=this.$('#streamContent'); if(!container)return;
+    if(refresh)container.querySelector('#row-telegram-sources')?.remove();
+    if(container.querySelector('#row-telegram-sources'))return;
+    try{
+      const d=await this.requestJson(this.localApiBase+'/api/telegram-channel/files?limit=12');
+      const files=Array.isArray(d?.files)?d.files:[];
+      if(!files.length)return;
+      this.posts['telegram-sources']=files;
+      container.insertAdjacentHTML('afterbegin',this._buildTrackHtml('telegram-sources','Telegram Sources',files.map(f=>({...f,is_file:true}))));
+    }catch(e){}
+  }
 
   // ══════════════════════════════════════════════════════════════
   //  HELPERS
@@ -5382,6 +5474,14 @@ class PencariMovieApp {
     this.$('#fileDetailStreamBtn').classList.remove('hidden');
 
     try {
+      if (String(shortCode).startsWith('tg_')) {
+        const tgData = await this.requestJson(this.localApiBase+'/api/telegram-channel/file?short_code='+encodeURIComponent(shortCode));
+        if (!tgData?.ok) throw new Error(tgData?.error||'Telegram file unavailable');
+        this._knownFiles.set(shortCode,tgData);
+        this._endResolving(true);
+        this._renderResolvedFile(tgData,shortCode);
+        return;
+      }
       // ── Cache check for resolve-file (immutable mapping, no TTL) ──
       const resolveCacheKey = this._cacheKey('resolve', { shortCode, botId: this.botId || '' });
       const cached = this._cacheGet(resolveCacheKey);
@@ -5477,7 +5577,7 @@ class PencariMovieApp {
    * @param {string} shortCode — fallback title
    */
   _renderResolvedFile(data, shortCode) {
-    const fileId = data.file_id_mt || data.file_id || '';
+    const fileId = data.file_id_mt || data.file_id || data.play_url || '';
     const title = data.title || shortCode;
     const fileSize = data.file_size || 0;
     const fileType = data.file_type || data.mime || 'file';
@@ -5520,8 +5620,8 @@ class PencariMovieApp {
     const isEmbeddable = mediaType === 'video' || mediaType === 'audio';
 
     if (isEmbeddable && fileId && fileSize > 0) {
-      // Build local download URL as video/audio source
-      const streamUrl = this.buildDownloadUrl(fileId, fileSize, title, data.mime || fileType, data.bot_id, shortCode);
+      // Telegram-source files already expose a local range-capable play URL.
+      const streamUrl = data.play_url || this.buildDownloadUrl(fileId, fileSize, title, data.mime || fileType, data.bot_id, shortCode);
       this.currentStreamUrl = streamUrl;
 
       if (mediaType === 'video') {
@@ -5585,13 +5685,13 @@ class PencariMovieApp {
 
     // Download button: build local download URL
     if (fileId && fileSize > 0) {
-      const downloadUrl = this.buildDownloadUrl(fileId, fileSize, title, data.mime || fileType, data.bot_id, shortCode);
+      const downloadUrl = data.play_url || this.buildDownloadUrl(fileId, fileSize, title, data.mime || fileType, data.bot_id, shortCode);
       this.$('#fileDetailDownloadBtn').setAttribute('data-url', downloadUrl);
       this.$('#fileDetailDownloadBtn').disabled = false;
       this.$('#fileDetailDownloadBtn').innerHTML = '<i class="fas fa-download"></i> Download';
     } else {
       this.$('#fileDetailDownloadBtn').disabled = true;
-      this.$('#fileDetailDownloadBtn').innerHTML = '<i class="fas fa-download"></i> No file ID';
+      this.$('#fileDetailDownloadBtn').innerHTML = '<i class="fas fa-download"></i> Unavailable';
     }
 
     this._renderLibraryButton(shortCode, data, title, thumbnail, fileSize);
