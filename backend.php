@@ -7658,6 +7658,7 @@ function fd_load_catalog_settings(): array
     $defaults = [
         'catalogs_enabled' => true,
         'country' => '',
+        'telegram_channel_url' => '',
         'enabled_types' => [
             'movie' => true,
             'series' => true,
@@ -7732,6 +7733,10 @@ function fd_load_catalog_settings(): array
             }
             if (isset($data['country']) && is_string($data['country'])) {
                 $defaults['country'] = strtoupper(trim(preg_replace('/[^a-zA-Z0-9_-]/', '', $data['country'])));
+            }
+            if (isset($data['telegram_channel_url']) && is_string($data['telegram_channel_url'])) {
+                $tg = fd_normalize_telegram_channel_url($data['telegram_channel_url']);
+                $defaults['telegram_channel_url'] = $tg['url'];
             }
             if (!empty($data['enabled_types']) && is_array($data['enabled_types'])) {
                 if (isset($data['enabled_types']['movie'])) {
