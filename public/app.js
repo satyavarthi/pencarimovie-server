@@ -334,6 +334,8 @@ class PencariMovieApp {
       this.closeSettingsGate();
     });
 
+    this._initDiscoveryFilters(); this._loadTelegramChannelSettings();
+
     this.$('#settingsBtn').addEventListener('click', () => {
       this.showSettingsGate();
     });
@@ -2702,6 +2704,14 @@ class PencariMovieApp {
     this._cacheClear();
   }
 
+  _initDiscoveryFilters() {
+    const ids=['pmFilterType','pmFilterCountry','pmFilterYear','pmFilterGenre','pmFilterSort'], els=Object.fromEntries(ids.map(id=>[id,this.$('#'+id)])); if(!els.pmFilterType)return;
+    for(let y=new Date().getFullYear();y>=1950;y--){const o=document.createElement('option');o.value=String(y);o.textContent=String(y);els.pmFilterYear.appendChild(o);}
+    const apply=()=>{const type=els.pmFilterType.value,country=els.pmFilterCountry.value,year=els.pmFilterYear.value,genre=els.pmFilterGenre.value,sort=els.pmFilterSort.value;document.querySelectorAll('#streamContent .stream-content-row').forEach(row=>{const id=(row.id||'').replace(/^row-/,'');const title=row.querySelector('.stream-content-row__title')?.textContent||'';const tm=type==='all'||(type==='movie'&&/movie/i.test(title))||(type==='series'&&/series|k-drama|j-drama|anime series/i.test(title))||(type==='other'&&/telegram|file/i.test(title));row.hidden=!(tm&&(country==='all'||this._rowCountry(id)===country));const track=row.querySelector('.stream-content-row__track');if(!track)return;[...track.querySelectorAll('.stream-card')].forEach(card=>{const meta=card.querySelector('.stream-card__meta')?.textContent||'';card.hidden=!((year==='all'||new RegExp('(?:^|\\D)'+year+'(?:\\D|$)').test(meta))&&(genre==='all'||meta.toLowerCase().includes(genre.toLowerCase())));});if(sort!=='default'){const cards=[...track.children].filter(c=>!c.hidden);cards.sort((a,b)=>{const ma=a.querySelector('.stream-card__meta')?.textContent||'',mb=b.querySelector('.stream-card__meta')?.textContent||'',ya=parseInt((ma.match(/\\b(19|20)\\d{2}\\b/)||[])[0]||'0'),yb=parseInt((mb.match(/\\b(19|20)\\d{2}\\b/)||[])[0]||'0');return sort==='title-asc'?(a.querySelector('.stream-card__title')?.textContent||'').localeCompare(b.querySelector('.stream-card__title')?.textContent||''):sort==='year-asc'?ya-yb:yb-ya;});cards.forEach(c=>track.appendChild(c));}});const sum=[];if(type!=='all')sum.push(type==='movie'?'Movies':type==='series'?'Series':'Files');if(country!=='all')sum.push(els.pmFilterCountry.options[els.pmFilterCountry.selectedIndex].text);if(year!=='all')sum.push(year);if(genre!=='all')sum.push(genre);if(sort!=='default')sum.push(els.pmFilterSort.options[els.pmFilterSort.selectedIndex].text);this.$('#pmFilterSummary').textContent=sum.length?sum.join(' · '):'Showing everything';}; ids.forEach(id=>els[id]?.addEventListener('change',apply));this.$('#pmFilterClear')?.addEventListener('click',()=>{ids.forEach(id=>{if(els[id])els[id].value=id==='pmFilterSort'?'default':'all';});apply();});this._applyDiscoveryFilters=apply;
+  }
+  _rowCountry(id){const map={malay:'MY',indonesian:'ID',korea:'KR',japan:'JP',china:'CN',thai:'TH',filipino:'PH',bollywood:'IN',english:'US'};return map[String(id).toLowerCase()]||'';}
+  async _loadTelegramChannelSettings(){const input=this.$('#telegramChannelInput');if(!input)return;try{const d=await this.requestJson(this.localApiBase+'/api/telegram-channel');if(d?.ok)input.value=d.url||'';}catch(e){}this.$('#telegramChannelSaveBtn')?.addEventListener('click',async()=>{const status=this.$('#telegramChannelStatus'),url=input.value.trim();if(status)status.textContent='Saving…';try{const d=await this.requestJson(this.localApiBase+'/api/telegram-channel',{method:'POST',body:JSON.stringify({url})});if(!d?.ok)throw new Error(d?.error||d?.message||'Could not save');if(status)status.textContent=d.url?'Saved ('+d.type+')':'Channel link cleared';}catch(e){if(status)status.textContent='✕ '+e.message;}});}
+
   // ══════════════════════════════════════════════════════════════
   //  HELPERS
   // ══════════════════════════════════════════════════════════════
@@ -3886,7 +3896,7 @@ class PencariMovieApp {
     const id = item.id || '';
 
     return `
-      <div class="stream-card" data-post-id="${id}" data-post-title="${this.escapeHtml(title)}">
+      <div class="stream-card" data-post-id="${id}" data-post-title="${this.escapeHtml(title)}" data-year="${this.escapeHtml(String(year))}" data-genre="${this.escapeHtml(String(category))}">
         <img class="stream-card__thumb" src="${thumbnail}" alt="${this.escapeHtml(title)}" loading="lazy"
              onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%22280%22 height=%22158%22><rect fill=%22%232a2a2a%22 width=%22280%22 height=%22158%22/><text fill=%22%23808080%22 x=%22140%22 y=%2279%22 text-anchor=%22middle%22 font-size=%2214%22>${this.escapeHtml(title)}</text></svg>'">
         <div class="stream-card__overlay">
@@ -4311,6 +4321,7 @@ class PencariMovieApp {
       console.warn('Failed to load initial data:', error);
     } finally {
       this.showLoading(false);
+    this._applyDiscoveryFilters?.();
     }
   }
 
