@@ -7853,6 +7853,32 @@ function fd_load_catalog_settings(): array
 /**
  * Save catalog settings to disk.
  */
+function fd_telegram_user_session_path(): string
+{
+    return fd_storage_path('storage/telegram-user/session.madeline');
+}
+
+function fd_telegram_user_api(): array
+{
+    fd_ensure_autoload();
+    [$apiId,$apiHash] = fd_load_cached_api_credentials();
+    if ($apiId === null || $apiHash === null) {
+        throw new \RuntimeException('Telegram API credentials are not available yet. Connect your PencariMovie bot first.');
+    }
+    $path = fd_telegram_user_session_path();
+    $dir = dirname($path);
+    if (!is_dir($dir)) @mkdir($dir,0777,true);
+    $settings = new \danog\MadelineProto\Settings();
+    $settings->getAppInfo()->setApiId((int)$apiId)->setApiHash((string)$apiHash);
+    $settings->getConnection()->setIpv6(false)->setTimeout(15.0)->setObfuscated(false)->setUseDoH(false);
+    $settings->getLogger()->setLevel(\danog\MadelineProto\Logger::FATAL_ERROR);
+    $settings->getLogger()->setMaxSize(FD_MAX_LOG_SIZE);
+    $settings->getRpc()->setRpcDropTimeout(180)->setRpcResendTimeout(12);
+    $settings->getFiles()->setDownloadParallelChunks(max(1,(int)(fd_env('FD_DOWNLOAD_PARALLEL_CHUNKS') ?: 4)));
+    $api = new \danog\MadelineProto\API($path,$settings);
+    return [$api,$path];
+}
+
 function fd_telegram_sources(): array
 {
     $s = fd_load_catalog_settings();
@@ -13495,6 +13521,57 @@ if (str_starts_with($path, '/api/')) {
 
     if ($path === '/api/tunnel/disable' && $method === 'POST') {
         fd_json(fd_disable_tunnel());
+    }
+
+    // ── Telegram user account access for channel history ─────────────────
+    if ($path === '/api/telegram-user/status' && $method === 'GET') {
+        $session = fd_telegram_user_session_path();
+        if (!is_dir($session) && !is_file($session)) fd_json(['ok'=>1,'logged_in'=>false]);
+        try {
+            [$api] = fd_telegram_user_api();
+            $self = $api->getSelf();
+            try { $api->disconnect(); } catch (\Throwable $_e) {}
+            fd_json(['ok'=>1,'logged_in'=>!empty($self['id']),'user'=>[
+                'id'=>(string)($self['id']??''),
+                'username'=>(string)($self['username']??''),
+                'name'=>trim((string)($self['first_name']??'').' '.(string)($self['last_name']??'')),
+            ]]);
+        } catch (\Throwable $e) {
+            fd_json(['ok'=>1,'logged_in'=>false,'error'=>$e->getMessage()]);
+        }
+    }
+    if ($path === '/api/telegram-user/qr' && $method === 'GET') {
+        try {
+            [$api] = fd_telegram_user_api();
+            $qr = $api->qrLogin();
+            if ($qr) {
+                fd_json(['ok'=>1,'logged_in'=>false,'needs_2fa'=>false,'svg'=>$qr->getQRSvg(280,2)]);
+            }
+            $needs2fa = false;
+            try { $needs2fa = $api->getAuthorization() === \danog\MadelineProto\API::WAITING_PASSWORD; } catch (\Throwable $_e) {}
+            try { $api->disconnect(); } catch (\Throwable $_e) {}
+            fd_json(['ok'=>1,'logged_in'=>!$needs2fa,'needs_2fa'=>$needs2fa,'svg'=>'']);
+        } catch (\Throwable $e) {
+            fd_json(['ok'=>0,'error'=>'Telegram QR login failed: '.$e->getMessage()],502);
+        }
+    }
+    if ($path === '/api/telegram-user/2fa' && $method === 'POST') {
+        $in=json_decode((string)file_get_contents('php://input'),true);
+        $password=is_array($in)?(string)($in['password']??''):'';
+        if($password==='') fd_json(['ok'=>0,'error'=>'2FA password is required.'],400);
+        try {
+            [$api] = fd_telegram_user_api();
+            $api->complete2faLogin($password);
+            $self=$api->getSelf();
+            try { $api->disconnect(); } catch (\Throwable $_e) {}
+            fd_json(['ok'=>1,'logged_in'=>true,'user'=>[
+                'id'=>(string)($self['id']??''),
+                'username'=>(string)($self['username']??''),
+                'name'=>trim((string)($self['first_name']??'').' '.(string)($self['last_name']??'')),
+            ]]);
+        } catch (\Throwable $e) {
+            fd_json(['ok'=>0,'error'=>'Telegram 2FA failed: '.$e->getMessage()],401);
+        }
     }
 
     // ── Telegram channel source manager API ─────────────────────────────
