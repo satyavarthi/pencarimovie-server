@@ -158,15 +158,13 @@ function fd_storage_path(string $file): string
 
 define('FD_SESSION_PATH', fd_storage_path('storage/session.madeline'));
 define('FD_WP_API_BASE', 'https://pencarimovie.com/wp-json/pencarimovie-server/v1');
-define('FD_WP_AJAX_URL', 'https://pencarimovie.com/wp-admin/admin-ajax.php');
 // Fallback host used when the primary domain is blocked by an in-path DPI
 // firewall (corporate / campus / hospital networks reset the TLS handshake on
 // the "pencarimovie.com" SNI). telegra.my is a Cloudflare Worker that reverse
-// proxies /wp-json/* and /wp-admin/admin-ajax.php back to pencarimovie.com over
-// Cloudflare's internal backbone, so the local SNI is a benign hostname.
+// proxies /wp-json/* back to pencarimovie.com over Cloudflare's internal backbone,
+// so the local SNI is a benign hostname.
 define('FD_WP_FALLBACK_HOST', 'telegra.my');
 define('FD_WP_API_BASE_FALLBACK', 'https://' . FD_WP_FALLBACK_HOST . '/wp-json/pencarimovie-server/v1');
-define('FD_WP_AJAX_URL_FALLBACK', 'https://' . FD_WP_FALLBACK_HOST . '/wp-admin/admin-ajax.php');
 define('FD_APP_VERSION', is_file(__DIR__ . '/.release-tag') ? ltrim(trim((string) file_get_contents(__DIR__ . '/.release-tag')), 'v') : '2.2.7');
 define('FD_WP_VERSION_URL', FD_WP_API_BASE . '/version');
 define('FD_API_SECRET_PATH', fd_storage_path('storage/api_secret.key'));
@@ -360,6 +358,7 @@ function fd_json(array $data, int $status = 200): never
         header('Access-Control-Allow-Origin: *');
         header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
         header('Access-Control-Allow-Headers: Content-Type, Authorization, X-API-Secret');
+        header('Access-Control-Allow-Private-Network: true');
         if ($status >= 400) {
             header('Connection: close');
         }
@@ -11775,11 +11774,13 @@ if ($isNuvioRoute) {
                 $postId = (int) substr($itemId, strlen('pm:post:'));
             }
 
-            $metaPostCache = fd_cache_path('meta_cache_' . md5('post_' . $postId . '_' . $itemType) . '.json');
+            $metaPostCache = fd_cache_path('meta_cache_' . md5('post_' . $postId) . '.json');
             if (is_file($metaPostCache) && (time() - (int)filemtime($metaPostCache)) < 1800) {
                 $cachedMeta = json_decode((string)@file_get_contents($metaPostCache), true);
-                if (is_array($cachedMeta) && isset($cachedMeta['meta'])) {
-                    fd_stremio_json($cachedMeta, 200, 'max-age=1800, public');
+                if (is_array($cachedMeta) && isset($cachedMeta['meta']) && !empty($cachedMeta['meta']['name']) && ($cachedMeta['meta']['name'] !== 'PencariMovie Media') && ($cachedMeta['meta']['name'] !== 'Untitled')) {
+                    if (($cachedMeta['meta']['type'] ?? '') !== 'series' || !empty($cachedMeta['meta']['videos'])) {
+                        fd_stremio_json($cachedMeta, 200, 'max-age=1800, public');
+                    }
                 }
             }
 
@@ -11977,7 +11978,7 @@ if ($isNuvioRoute) {
                 'genres' => $meta['genres'] ?? [],
             ]);
 
-            if (!empty($metaPostCache) && !empty($meta['name'])) {
+            if (!empty($metaPostCache) && !empty($meta['name']) && $title !== 'PencariMovie Media' && $cleanPostTitle !== 'Untitled' && (!empty($excerpt) || !empty($videos))) {
                 @file_put_contents($metaPostCache, json_encode(['meta' => $meta], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
             }
 
@@ -13152,12 +13153,17 @@ if (str_starts_with($path, '/api/')) {
         header('Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS');
         header('Access-Control-Allow-Headers: Content-Type, Authorization, X-API-Secret, Range');
         header('Access-Control-Expose-Headers: Accept-Ranges, Content-Range, Content-Length, Content-Type');
+        header('Access-Control-Allow-Private-Network: true');
         header('X-Content-Type-Options: nosniff');
         header('X-Frame-Options: SAMEORIGIN');
         header('Referrer-Policy: strict-origin-when-cross-origin');
     }
 
     if ($method === 'OPTIONS') {
+        header('Access-Control-Allow-Origin: *');
+        header('Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS');
+        header('Access-Control-Allow-Headers: Content-Type, Authorization, X-API-Secret, Range');
+        header('Access-Control-Allow-Private-Network: true');
         http_response_code(204);
         exit;
     }
