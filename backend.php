@@ -794,6 +794,63 @@ function fd_is_guest_provision_in_progress(): bool
     return true; // Another process is currently holding the provision lock
 }
 
+/**
+ * Spawns a non-blocking background CLI or fire-and-forget process to provision a guest bot.
+ * Allows stream list delivery (/stream/...) to return in milliseconds without blocking
+ * on 15s-30s MTProto key generation and hitting reverse proxy timeouts (e.g. Heroku H12).
+ */
+function fd_spawn_guest_provision(): bool
+{
+    if (fd_has_local_session() && fd_get_bot_id() !== '') {
+        return true;
+    }
+    if (fd_is_guest_provision_in_progress()) {
+        return true;
+    }
+
+    $root = fd_get_app_root();
+    $phpBin = PHP_BINARY;
+    if (PHP_SAPI !== 'cli' && PHP_SAPI !== 'phpdbg') {
+        $prefix = (string) fd_env('PREFIX', '');
+        if ($prefix !== '' && is_file($prefix . '/bin/php')) {
+            $phpBin = $prefix . '/bin/php';
+        } else {
+            $candidate = $root . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . (fd_is_windows() ? 'php.exe' : 'php');
+            if (is_file($candidate)) {
+                $phpBin = $candidate;
+            } elseif (is_file($root . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . (fd_is_windows() ? 'frankenphp.exe' : 'frankenphp'))) {
+                $phpBin = $root . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . (fd_is_windows() ? 'frankenphp.exe' : 'frankenphp') . ' php-cli';
+            }
+        }
+    }
+
+    $backendScript = $root . DIRECTORY_SEPARATOR . 'backend.php';
+    if (!is_file($backendScript)) {
+        $backendScript = __DIR__ . DIRECTORY_SEPARATOR . 'backend.php';
+    }
+
+    $cmd = '"' . $phpBin . '"'
+        . ' -dhtml_errors=0 -ddisplay_errors=0 -dlog_errors=1'
+        . ' "' . $backendScript . '"'
+        . ' provision';
+
+    fd_log('spawning background guest provision');
+
+    if (fd_is_windows()) {
+        @pclose(@popen('start "" /b ' . $cmd . ' > NUL 2>&1', 'r'));
+    } else {
+        @shell_exec('nohup ' . $cmd . ' > /dev/null 2>&1 &');
+    }
+
+    // Also trigger via local fire-and-forget HTTP request to /api/provision as fallback
+    $port = fd_get_listen_port();
+    if ($port > 0) {
+        fd_http_fire_and_forget("http://127.0.0.1:{$port}/api/provision", [], 'GET');
+    }
+
+    return true;
+}
+
 function fd_auto_provision_guest(): ?array
 {
     fd_ensure_autoload();
@@ -1205,8 +1262,34 @@ function fd_require_local_request(): void
 // list. Localhost / private-LAN requests bypass it so local installs are
 // unaffected. Remote clients pass a token as a /t/<token>/ path segment.
 
+/**
+ * Per-request memo for the auth state.
+ *
+ * fd_auth_load() used to re-read storage/auth.json AND re-derive a bcrypt hash
+ * on every call. password_hash() costs ~230ms on a shared-CPU container (PaaS)
+ * and the /stream route asks for the token twice per stream via
+ * fd_build_stremio_stream_url() -> fd_auth_enabled() + fd_auth_token(), i.e.
+ * ~200 bcrypt hashes per request. That alone pushed /stream responses to 53-61s
+ * and tripped the 30s reverse-proxy timeout (Heroku H12 / equivalent) whenever
+ * SERVER_PASSWORD was set. On a VPS without SERVER_PASSWORD no hashing happened,
+ * which is why the same build was fast there.
+ */
+function fd_auth_cache(?array $data = null): ?array
+{
+    static $cache = null;
+    if ($data !== null) {
+        $cache = $data;
+    }
+    return $cache;
+}
+
 function fd_auth_load(): array
 {
+    $cached = fd_auth_cache();
+    if ($cached !== null) {
+        return $cached;
+    }
+
     $path = FD_AUTH_PATH;
     $data = [];
     if (is_file($path)) {
@@ -1217,7 +1300,10 @@ function fd_auth_load(): array
     }
     $envPw = trim((string) (fd_env('SERVER_PASSWORD') ?: ''));
     if ($envPw !== '') {
-        $data['password_hash'] = password_hash($envPw, PASSWORD_DEFAULT);
+        // The env password is authoritative and is compared directly (constant
+        // time) by fd_auth_verify_password(). NEVER bcrypt it here — this runs on
+        // every load and bcrypt is ~230ms on a throttled container.
+        $data['env_password'] = true;
     } elseif (empty($data['password_hash'])) {
         $data['password_hash'] = password_hash(FD_AUTH_DEFAULT_PASSWORD, PASSWORD_DEFAULT);
     }
@@ -1234,6 +1320,7 @@ function fd_auth_load(): array
     if (!is_file($path)) {
         fd_auth_save($data);
     }
+    fd_auth_cache($data);
     return $data;
 }
 
@@ -1258,6 +1345,9 @@ function fd_auth_valid_tokens(): array
 
 function fd_auth_save(array $data): void
 {
+    // Keep the per-request memo in sync so a rotate/set-password in this request
+    // is visible to later fd_auth_token() / fd_auth_enabled() calls.
+    fd_auth_cache($data);
     @file_put_contents(FD_AUTH_PATH, json_encode($data, JSON_UNESCAPED_SLASHES), LOCK_EX);
 }
 
@@ -1281,6 +1371,13 @@ function fd_auth_rotate_token(): string
 
 function fd_auth_verify_password(string $pw): bool
 {
+    $envPw = trim((string) (fd_env('SERVER_PASSWORD') ?: ''));
+    if ($envPw !== '') {
+        // Constant-time compare of the env password. Skipping password_hash() /
+        // password_verify() here keeps bcrypt (~230ms per call on a throttled
+        // container) off the request hot path entirely.
+        return hash_equals($envPw, $pw);
+    }
     $hash = (string) (fd_auth_load()['password_hash'] ?? '');
     return $hash !== '' && password_verify($pw, $hash);
 }
@@ -1394,8 +1491,14 @@ function fd_auth_record_success(string $ip): void
 function fd_auth_token_from_request(): string
 {
     $path = (string) parse_url((string) ($_SERVER['REQUEST_URI'] ?? ''), PHP_URL_PATH);
-    // Support clean /<token>/manifest.json or /<token>/stream/... (32-char hex token)
-    if (preg_match('#^/([0-9a-fA-F]{32})(?:/|$)#', $path, $m)) {
+    // Support clean /<token>/manifest.json or /<token>/stream/... (hex token).
+    // Accept any length >= 32: the generated token is bin2hex(random_bytes(16)) (32 chars),
+    // but an operator-supplied SERVER_TOKEN may be longer (a 34-char token was observed on
+    // Render). Hard-coding {32} made the WHOLE /<token>/... URL form 404 for such a token,
+    // even though ?token= / X-Auth-Token / the pm_auth cookie all still worked — so the addon
+    // installed from the dashboard could not load anything. Keep this in sync with
+    // fd_strip_token_prefix(), which must strip the same prefix after auth succeeds.
+    if (preg_match('#^/([0-9a-fA-F]{32,})(?:/|$)#', $path, $m)) {
         return strtolower($m[1]);
     }
     if (preg_match('#^/t/([A-Za-z0-9]+)(?:/|$)#', $path, $m)) {
@@ -1448,7 +1551,8 @@ function fd_require_auth(): void
  */
 function fd_strip_token_prefix(string $path): string
 {
-    if (preg_match('#^/[0-9a-fA-F]{32}(/.*)?$#', $path, $m)) {
+    // Must match the same token length rule as fd_auth_token_from_request().
+    if (preg_match('#^/[0-9a-fA-F]{32,}(/.*)?$#', $path, $m)) {
         return (!empty($m[1])) ? $m[1] : '/';
     }
     if (preg_match('#^/t/[A-Za-z0-9]+(/.*)?$#', $path, $m)) {
@@ -1855,8 +1959,15 @@ function fd_amphp_http_request(string $url, string $method, array $headers, stri
     }
 
     $tStart = microtime(true);
-    // Ensure a safe timeout of at least 10 seconds to accommodate TLS handshakes
-    $effectiveTimeout = max(10, $timeout);
+    // Explicitly configure Amp Request transfer & inactivity timeouts to match $effectiveTimeout.
+    // Amp defaults transferTimeout and inactivityTimeout to 10s internally; without these setters,
+    // any request taking longer than 10s (e.g. cold /stream-files or batch /resolve-files) gets cancelled
+    // by Amp's internal timer and retries, adding 10-15s unnecessary latency.
+    $effectiveTimeout = max(3, $timeout);
+    $request->setTransferTimeout((float) $effectiveTimeout);
+    $request->setInactivityTimeout((float) $effectiveTimeout);
+    $request->setTlsHandshakeTimeout((float) min(10, $effectiveTimeout));
+    $request->setTcpConnectTimeout((float) min(10, $effectiveTimeout));
     $cancellation = new \Amp\TimeoutCancellation($effectiveTimeout);
     $response = $client->request($request, $cancellation);
     $status = $response->getStatus();
@@ -1918,13 +2029,17 @@ function fd_http_get_many_amp(array $urls, array $options = []): array
     }
 
     $headers = (array) ($options['headers'] ?? []);
-    $timeout = max(10, (int) ($options['timeout'] ?? 12));
+    $timeout = max(1, (int) ($options['timeout'] ?? 12));
 
     $futures = [];
     foreach ($urls as $key => $url) {
         $futures[$key] = \Amp\async(static function () use ($client, $url, $headers, $timeout): array {
             try {
                 $request = new \Amp\Http\Client\Request($url, 'GET');
+                $request->setTransferTimeout((float) $timeout);
+                $request->setInactivityTimeout((float) $timeout);
+                $request->setTlsHandshakeTimeout((float) min(10, $timeout));
+                $request->setTcpConnectTimeout((float) min(10, $timeout));
                 foreach ($headers as $h) {
                     $parts = explode(':', $h, 2);
                     if (count($parts) === 2) {
@@ -2497,6 +2612,17 @@ function fd_resolve_external_media_metadata(string $itemId, string $itemType = '
             }
         }
 
+
+        // 2. Query WordPress /lookup-id (Manticore media_ids_idx) before falling back to Cinemeta
+        if ($title === '') {
+            $wpLookup = fd_http_json(FD_WP_API_BASE . '/lookup-id?' . http_build_query(['prefix' => 'imdb', 'id' => $imdbId]), [], 'GET', 3);
+            if (!empty($wpLookup['title'])) {
+                $title = (string) $wpLookup['title'];
+                $year = (string) ($wpLookup['year'] ?? '');
+                $akaTitle = (string) ($wpLookup['aka'] ?? '');
+                @file_put_contents($cacheFile, json_encode(['name' => $title, 'year' => $year, 'aka' => $akaTitle], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+            }
+        }
 
         // 3. If still missing, query configured upstream Stremio addons
         if ($title === '' || ($year === '' && ($season !== null || $itemType === 'series'))) {
@@ -6493,6 +6619,7 @@ function fd_fetch_post_files_paged(int $postId, array $opts = []): array
         if ($files === []) {
             break;
         }
+        $isShortPage = count($files) < $pageSize;
 
         $newEpsThisPage = 0;
         foreach ($files as $file) {
@@ -6750,19 +6877,9 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
             if (empty($localMeta['title'])) {
                 $localMeta = fd_lookup_local_catalog_by_prefix('pm', (string) $postId);
             }
-            if (empty($localMeta['title'])) {
-                $postData = fd_fetch_stream_ajax('get_post', ['post_id' => $postId]);
-                $postItem = !empty($postData) && is_array($postData) ? ($postData[0] ?? $postData) : [];
-                $postTitle = (string) ($postItem['title'] ?? ($postItem['post_title'] ?? ''));
-                $postYear = (string) ($postItem['year'] ?? '');
-                if ($postYear === '' && preg_match('/\b(19\d\d|20\d\d)\b/', $postTitle, $ym)) {
-                    $postYear = $ym[1];
-                }
-                $localMeta = [
-                    'title' => $postTitle,
-                    'year'  => $postYear,
-                ];
-            }
+            // Do not block on get_post here! stream-files?id=post:POST_ID resolves
+            // the title and files on the WordPress origin directly (~0.3s).
+            // We only call get_post as fallback if stream-files returns 0 items.
             $post = [
                 'title' => (string) ($localMeta['title'] ?? ''),
                 'year'  => (string) ($localMeta['year'] ?? ''),
@@ -6785,7 +6902,7 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
     $filter = fd_episode_stream_filter($season, $episode);
     $all = [];
     $seen = [];
-    $add = static function (array $files) use (&$all, &$seen, $filter, $maxFiles, $postYear, $keyword, $fullTitle, $season, $episode): void {
+    $add = static function (array $files) use (&$all, &$seen, $filter, $maxFiles, &$postYear, &$keyword, &$fullTitle, $season, $episode): void {
         foreach ($files as $file) {
             if (count($all) >= $maxFiles) {
                 return;
@@ -6819,14 +6936,33 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
     // slow multi-query fallbacks across WordPress posts.
     $fastPathDone = false;
     $idParam = trim((string) ($preloadedPost['id'] ?? ($preloadedPost['external_id'] ?? ($preloadedPost['imdb_id'] ?? ($postId > 0 ? "post:{$postId}" : '')))));
+    $idParam = preg_replace('/:\d+:\d+$/', '', $idParam);
     if ($keyword !== '' || $idParam !== '') {
         $apiBase = FD_WP_API_BASE;
         $url = "{$apiBase}/stream-files?type=series&season={$season}&episode={$episode}&limit={$maxFiles}"
             . ($keyword !== '' ? '&title=' . urlencode($keyword) : '')
             . ($idParam !== '' ? "&id=" . urlencode($idParam) : '');
-        $res = fd_http_json($url, [], 'GET', 5);
+        $res = fd_http_json($url, [], 'GET', 15);
         if (isset($res['ok'])) {
             $fastPathDone = true;
+            if (empty($fullTitle) && !empty($res['resolved_title'])) {
+                $fullTitle = (string) $res['resolved_title'];
+                $keyword = fd_stream_keyword_from_post_title($fullTitle);
+                $resYear = (string) ($res['resolved_year'] ?? '');
+                if ($resYear !== '') {
+                    $postYear = $resYear;
+                } elseif ($postYear === null && preg_match('/\b(19\d\d|20\d\d)\b/', $fullTitle, $ym)) {
+                    $postYear = $ym[1];
+                }
+                $post = ['title' => $fullTitle, 'year' => (string) ($postYear ?? '')];
+                if ($postId > 0) {
+                    $postMemoryCache[$postId] = $post;
+                }
+                if ($idParam !== '' && !str_starts_with($idParam, 'post:')) {
+                    $cFile = fd_cache_path('ext_meta_' . md5($idParam) . '.json');
+                    @file_put_contents($cFile, json_encode(['name' => $fullTitle, 'year' => (string) ($postYear ?? ''), 'aka' => ''], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+                }
+            }
             if (!empty($res['items']) && is_array($res['items'])) {
                 $add($res['items']);
             }
@@ -6834,11 +6970,52 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
     }
     $exactCount = count($all);
 
-    // If fast-path communicated with Manticore (returning items or confirming 0 items exist),
-    // return immediately to avoid burning 4-5s on pointless fallback scans.
-    if ($fastPathDone || count($all) > 0) {
+    // If fast-path returned items, return immediately.
+    if (count($all) > 0) {
         $elapsed = round(microtime(true) - $tStart, 3);
         fd_log('stremio episode streams resolved', [
+            'postId' => $postId,
+            'title' => $fullTitle,
+            'season' => $season,
+            'episode' => $episode,
+            'exactCount' => $exactCount,
+            'totalCount' => count($all),
+            'duration_seconds' => $elapsed,
+        ]);
+        return $all;
+    }
+
+    // Fallback: If stream-files returned 0 items and post title is still unknown for postId,
+    // fetch get_post as fallback so keyword fallback queries have the title to search.
+    $fetchedFallbackPost = false;
+    if (count($all) === 0 && empty($fullTitle) && $postId > 0) {
+        $postData = fd_fetch_stream_ajax('get_post', ['post_id' => $postId]);
+        $postItem = !empty($postData) && is_array($postData) ? ($postData[0] ?? $postData) : [];
+        $postTitle = (string) ($postItem['title'] ?? ($postItem['post_title'] ?? ''));
+        $postYearStr = (string) ($postItem['year'] ?? '');
+        if ($postYearStr === '' && preg_match('/\b(19\d\d|20\d\d)\b/', $postTitle, $ym)) {
+            $postYearStr = $ym[1];
+        }
+        $post = [
+            'title' => $postTitle,
+            'year'  => $postYearStr,
+        ];
+        if (!empty($post['title'])) {
+            $postMemoryCache[$postId] = $post;
+            $fullTitle = $post['title'];
+            $keyword = fd_stream_keyword_from_post_title($fullTitle);
+            if ($postYear === null && $postYearStr !== '') {
+                $postYear = $postYearStr;
+            }
+            $fetchedFallbackPost = true;
+        }
+    }
+
+    // If fast-path communicated with Manticore with a known title/keyword and confirmed 0 items exist,
+    // return immediately to avoid burning 4-5s on pointless fallback scans.
+    if ($fastPathDone && $keyword !== '' && !$fetchedFallbackPost) {
+        $elapsed = round(microtime(true) - $tStart, 3);
+        fd_log('stremio episode streams resolved (fast-path empty)', [
             'postId' => $postId,
             'title' => $fullTitle,
             'season' => $season,
@@ -12022,8 +12199,20 @@ if ($isNuvioRoute) {
                 }
             }
 
-            $postData = fd_fetch_stream_ajax('get_post', ['post_id' => $postId]);
-            $post = !empty($postData) && is_array($postData) ? ($postData[0] ?? $postData) : [];
+            fd_ensure_autoload();
+            $hasAmp = function_exists('Amp\\async') && function_exists('Amp\\Future\\await');
+            $isDirectSeriesType = ($itemType === 'series' || str_contains(strtolower($itemType), 'series'));
+
+            // If series is directly known from the route, fan out get_post and episode files concurrently
+            if ($isDirectSeriesType && $hasAmp) {
+                $postFuture = \Amp\async(static fn(): array => fd_fetch_stream_ajax('get_post', ['post_id' => $postId]));
+                $filesFuture = \Amp\async(static fn(): array => fd_fetch_series_episode_files($postId));
+                [$postData, $files] = \Amp\Future\await([$postFuture, $filesFuture]);
+                $post = !empty($postData) && is_array($postData) ? ($postData[0] ?? $postData) : [];
+            } else {
+                $postData = fd_fetch_stream_ajax('get_post', ['post_id' => $postId]);
+                $post = !empty($postData) && is_array($postData) ? ($postData[0] ?? $postData) : [];
+            }
 
             $title = $post['title'] ?? 'PencariMovie Media';
             $thumb = $post['thumbnail_url'] ?? '';
@@ -12031,11 +12220,13 @@ if ($isNuvioRoute) {
             $cats = (array) ($post['categories'] ?? []);
             $tags = (array) ($post['tags'] ?? []);
 
-            $isSeries = ($itemType === 'series' || str_contains(strtolower($itemType), 'series')) || preg_match('/tvseries|series|season|episode|drama/i', $title . ' ' . implode(' ', $cats));
+            $isSeries = $isDirectSeriesType || preg_match('/tvseries|series|season|episode|drama/i', $title . ' ' . implode(' ', $cats));
             $resolvedType = ($itemType === 'series' || $isSeries) ? 'series' : 'movie';
 
             // Only series metadata requires episode files to construct the videos array
-            $files = ($resolvedType === 'series') ? fd_fetch_series_episode_files($postId) : [];
+            if (!isset($files)) {
+                $files = ($resolvedType === 'series') ? fd_fetch_series_episode_files($postId) : [];
+            }
 
             fd_log('stremio meta post resolved', [
                 'postId' => $postId,
@@ -12347,9 +12538,11 @@ if ($isNuvioRoute) {
                             'duration_seconds' => round(microtime(true) - $streamStart, 4),
                         ]);
                         fd_stremio_json($cachedData, 200, 'max-age=300, public');
+                    } elseif ((time() - (int)filemtime($streamCacheFile)) < 60) {
+                        // Short-cache negative/empty results for 60s to prevent rapid repeated lookup stampedes
+                        fd_stremio_json($cachedData, 200, 'no-cache, no-store, must-revalidate');
                     } else {
-                        // Cached file has no playable streams (e.g. stale "No streams found" placeholder).
-                        // Purge it so a fresh lookup is executed immediately.
+                        // Expired beyond 60s: purge so a fresh lookup can proceed
                         @unlink($streamCacheFile);
                     }
                 }
@@ -12379,53 +12572,111 @@ if ($isNuvioRoute) {
             fd_stremio_json(['streams' => $streams]);
         }
 
-        // If no bot is connected / bot is disconnected, attempt auto-provisioning first
-        if (!$hasSession || $botIdStr === '') {
-            if (fd_is_guest_provision_in_progress()) {
-                // Server is actively provisioning a guest bot session in the background
+        // Clock pre-flight. A skewed device can NEVER provision: the MTProto handshake needs a
+        // clock within ~5 minutes of Telegram's, so provisioning would fail and the user would
+        // have no idea why. This must be surfaced here, as a stream item, because Stremio only
+        // renders a stream item's `description` — never an HTTP error body — so a 403 from
+        // /api/download is invisible (same reason the locked-stream response is a stream, not a 401).
+        // Returning early also keeps the skew out of the 300s stream cache.
+        // Cost: one unauthenticated HTTPS request to a Telegram DC (~0.5s, the frontend already
+        // pays it as a pre-flight) and it degrades to ok:false when Telegram is unreachable, so
+        // it can never turn into a new failure mode. Threshold matches fd_auto_provision_guest().
+        if (!$hasSession) {
+            $clockPreflight = fd_measure_clock_offset();
+            if ($clockPreflight['ok'] && abs((int) $clockPreflight['offset']) > 30) {
+                fd_log('stremio stream: clock skew blocks provisioning', [
+                    'offset_seconds' => (int) $clockPreflight['offset'],
+                ]);
                 $streams[] = [
-                    'name' => 'PencariMovie',
-                    'description' => "Connecting guest bot in progress...\nPlease refresh or try again in a few seconds.",
-                    'externalUrl' => $baseUrl . '/#settings'
+                    'name' => 'Device clock out of sync',
+                    'description' => fd_clock_skew_message(),
+                    'externalUrl' => rtrim($baseUrl, '/') . '/#settings',
                 ];
                 fd_stremio_json(['streams' => $streams], 200, 'no-cache, no-store, must-revalidate');
             }
+        }
 
-            $autoProv = fd_auto_provision_guest();
-            if ($autoProv && !empty($autoProv['bot_id'])) {
-                $hasSession = true;
-                $botIdStr = (string) $autoProv['bot_id'];
-            } else {
-                // Surface the real reason instead of a generic "not connected".
-                // A clock-skew error is actionable and must be shown verbatim so
-                // the user knows to enable NTP; otherwise they only see a vague
-                // "Telegram bot not connected" and cannot fix anything.
-                $provErr = trim((string) ($autoProv['error'] ?? ''));
-                if ($provErr !== '') {
-                    $streams[] = [
-                        'name' => 'PencariMovie',
-                        'description' => $provErr,
-                        'externalUrl' => $baseUrl . '/#settings',
-                    ];
-                    fd_stremio_json(['streams' => $streams], 200, 'no-cache, no-store, must-revalidate');
+        // If no bot is connected / bot is disconnected, spawn non-blocking background provisioning
+        // so stream lists return immediately (<1.5s) without blocking on 15s-30s MTProto key generation.
+        // Full MadelineProto connection is only required when the player starts GET /api/download.
+        // NOTE: this is fire-and-forget and returns bool, so it cannot report *why* it failed —
+        // the actionable cases (like the clock skew above) must be surfaced separately.
+        if (!$hasSession || $botIdStr === '') {
+            fd_log('stremio stream: no local bot session, triggering non-blocking guest provisioning', [
+                'has_session' => $hasSession,
+                'bot_id' => $botIdStr,
+            ]);
+            fd_spawn_guest_provision();
+        }
+
+        // ── Concurrent Pipeline Fan-Out ──
+        // Subtitles and upstream addons do not depend on local media file resolution.
+        // Dispatch both asynchronously via Amp\async() so their I/O runs concurrently
+        // with the local stream file queries (~200ms+ saved).
+        fd_ensure_autoload();
+        $hasAmp = function_exists('Amp\\async') && function_exists('Amp\\Future\\await');
+
+        $subtitlesFuture = null;
+        if ($hasAmp && !str_starts_with($itemId, 'pm:post:') && !str_starts_with($itemId, 'pm_post_') && !str_starts_with($itemId, 'pm:file:') && !str_starts_with($itemId, 'pm_file_')) {
+            $subtitlesFuture = \Amp\async(static function () use ($itemType, $itemId): array {
+                try {
+                    return fd_get_item_subtitles($itemType, $itemId);
+                } catch (\Throwable $e) {
+                    return [];
                 }
-                if (fd_is_guest_provision_in_progress()) {
-                    $streams[] = [
-                        'name' => 'PencariMovie',
-                        'description' => "Connecting guest bot in progress...\nPlease refresh or try again in a few seconds.",
-                        'externalUrl' => $baseUrl . '/#settings'
-                    ];
-                    fd_stremio_json(['streams' => $streams], 200, 'no-cache, no-store, must-revalidate');
-                } else {
-                    $streams[] = [
-                        'name' => 'PencariMovie',
-                        'description' => "Telegram bot not connected\nOpen Settings and paste a bot token",
-                        'externalUrl' => $baseUrl . '/#settings'
-                    ];
-                    fd_stremio_json(['streams' => $streams]);
-                }
+            });
+        }
+
+        $catSettings = fd_load_catalog_settings();
+        $configuredUpstreams = !empty($catSettings['upstream_enabled'])
+            ? (array) ($catSettings['upstream_manifests'] ?? [])
+            : [];
+        $upstreamUrls = [];
+        $isLocalPmId = str_starts_with($itemId, 'pm:') || str_starts_with($itemId, 'pm_');
+        if (!$isLocalPmId && !empty($configuredUpstreams)) {
+            foreach ($configuredUpstreams as $idx => $upstream) {
+                $manifestUrl = trim((string)($upstream['url'] ?? ''));
+                if ($manifestUrl === '') continue;
+                $baseAddonUrl = preg_replace('#/manifest\.json(\?.*)?$#i', '', $manifestUrl);
+                $upstreamUrls['up_' . $idx] = rtrim($baseAddonUrl, '/') . "/stream/{$itemType}/" . urlencode($itemId) . ".json";
             }
         }
+
+        $upstreamFuture = ($hasAmp && !empty($upstreamUrls)) ? \Amp\async(static function () use ($upstreamUrls): array {
+            $streams = [];
+            try {
+                $ampUpstreamResults = fd_http_get_many_amp($upstreamUrls, ['timeout' => 4]);
+                if ($ampUpstreamResults['ok']) {
+                    foreach ($ampUpstreamResults['results'] as $row) {
+                        $body = (string) ($row['body'] ?? '');
+                        if ($body !== '') {
+                            $uRes = json_decode($body, true);
+                            if (is_array($uRes) && !empty($uRes['streams']) && is_array($uRes['streams'])) {
+                                foreach ($uRes['streams'] as $uStream) {
+                                    if (is_array($uStream) && (!empty($uStream['url']) || !empty($uStream['infoHash']) || !empty($uStream['externalUrl']))) {
+                                        $streams[] = $uStream;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    foreach ($upstreamUrls as $upstreamStreamUrl) {
+                        $uRes = fd_http_json($upstreamStreamUrl, [], 'GET', 4);
+                        if (!empty($uRes['streams']) && is_array($uRes['streams'])) {
+                            foreach ($uRes['streams'] as $uStream) {
+                                if (is_array($uStream) && (!empty($uStream['url']) || !empty($uStream['infoHash']) || !empty($uStream['externalUrl']))) {
+                                    $streams[] = $uStream;
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (\Throwable $e) {
+                // Ignore upstream network failures
+            }
+            return $streams;
+        }) : null;
 
         // Collect all target files to stream
         $filesToStream = [];
@@ -12696,9 +12947,20 @@ if ($isNuvioRoute) {
                             . ($cleanMovieTitle !== '' ? "&title=" . urlencode($cleanMovieTitle) : '')
                             . ($searchedYear !== '' ? "&year=" . urlencode($searchedYear) : '')
                             . ($itemId !== '' ? "&id=" . urlencode($itemId) : '');
-                        $res = fd_http_json($mUrl, [], 'GET', 5);
+                        $res = fd_http_json($mUrl, [], 'GET', 15);
                         if (isset($res['ok'])) {
                             $movieFastPathDone = true;
+                            if (empty($searchedTitle) && !empty($res['resolved_title'])) {
+                                $searchedTitle = (string) $res['resolved_title'];
+                                $primaryMovieTitle = $searchedTitle;
+                                if (empty($searchedYear) && !empty($res['resolved_year'])) {
+                                    $searchedYear = (string) $res['resolved_year'];
+                                }
+                            }
+                            if (!empty($res['resolved_title']) && $itemId !== '' && !str_starts_with($itemId, 'pm:')) {
+                                $cFile = fd_cache_path('ext_meta_' . md5($itemId) . '.json');
+                                @file_put_contents($cFile, json_encode(['name' => (string)$res['resolved_title'], 'year' => (string)($res['resolved_year'] ?? ''), 'aka' => ''], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+                            }
                             if (!empty($res['items']) && is_array($res['items'])) {
                                 foreach ($res['items'] as $f) {
                                     $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
@@ -12717,7 +12979,7 @@ if ($isNuvioRoute) {
                         if ($cleanAkaTitle !== '') {
                             $apiBase = FD_WP_API_BASE;
                             $mUrl = "{$apiBase}/stream-files?title=" . urlencode($cleanAkaTitle) . "&type=movie&year=" . urlencode($searchedYear) . "&limit=150";
-                            $res = fd_http_json($mUrl, [], 'GET', 5);
+                            $res = fd_http_json($mUrl, [], 'GET', 15);
                             if (isset($res['ok']) && !empty($res['items']) && is_array($res['items'])) {
                                 $movieFastPathDone = true;
                                 foreach ($res['items'] as $f) {
@@ -13012,7 +13274,16 @@ if ($isNuvioRoute) {
 
         // Pre-resolve all streams and fetch subtitles only when files exist
         if (!empty($filesToStream)) {
-            $subtitlesForStream = fd_get_item_subtitles($itemType, $itemId);
+            if ($subtitlesFuture !== null) {
+                try {
+                    $subCancellation = new \Amp\TimeoutCancellation(0.8);
+                    $subtitlesForStream = $subtitlesFuture->await($subCancellation);
+                } catch (\Throwable $e) {
+                    $subtitlesForStream = [];
+                }
+            } else {
+                $subtitlesForStream = fd_get_item_subtitles($itemType, $itemId);
+            }
             $filesToStream = fd_prewarm_streams_batch($filesToStream, $botIdStr, $itemId);
         }
 
@@ -13404,47 +13675,28 @@ if ($isNuvioRoute) {
             $streams[] = $streamObj;
         }
 
-        // Fetch & merge streams from configured upstream addons (only when the
-        // master upstream switch is on).
-        $catSettings = fd_load_catalog_settings();
-        $configuredUpstreams = !empty($catSettings['upstream_enabled'])
-            ? (array) ($catSettings['upstream_manifests'] ?? [])
-            : [];
-        $upstreamUrls = [];
-        $isLocalPmId = str_starts_with($itemId, 'pm:') || str_starts_with($itemId, 'pm_');
-        if (!$isLocalPmId) {
-            foreach ($configuredUpstreams as $idx => $upstream) {
-                $manifestUrl = trim((string)($upstream['url'] ?? ''));
-                if ($manifestUrl === '') continue;
-                $baseAddonUrl = preg_replace('#/manifest\.json(\?.*)?$#i', '', $manifestUrl);
-                $upstreamUrls['up_' . $idx] = rtrim($baseAddonUrl, '/') . "/stream/{$itemType}/" . urlencode($itemId) . ".json";
-            }
-        }
-
-        if (!empty($upstreamUrls)) {
-            $ampUpstreamResults = fd_http_get_many_amp($upstreamUrls, ['timeout' => 4]);
-            if ($ampUpstreamResults['ok']) {
-                foreach ($ampUpstreamResults['results'] as $row) {
-                    $body = (string) ($row['body'] ?? '');
-                    if ($body !== '') {
-                        $uRes = json_decode($body, true);
-                        if (is_array($uRes) && !empty($uRes['streams']) && is_array($uRes['streams'])) {
-                            foreach ($uRes['streams'] as $uStream) {
-                                if (is_array($uStream) && (!empty($uStream['url']) || !empty($uStream['infoHash']) || !empty($uStream['externalUrl']))) {
-                                    $streams[] = $uStream;
-                                }
-                            }
-                        }
-                    }
+        // Merge streams from configured upstream addons (fetched concurrently via $upstreamFuture).
+        // Non-blocking guard: When local PencariMovie streams already exist, cap upstream wait
+        // to at most 0.8s so user streams list displays immediately without waiting for slow external addons.
+        if ($upstreamFuture !== null) {
+            try {
+                $waitTimeout = !empty($streams) ? 0.8 : 2.5;
+                $upCancellation = new \Amp\TimeoutCancellation($waitTimeout);
+                $upstreamStreams = $upstreamFuture->await($upCancellation);
+                foreach ($upstreamStreams as $uStream) {
+                    $streams[] = $uStream;
                 }
-            } else {
-                foreach ($upstreamUrls as $upstreamStreamUrl) {
-                    $uRes = fd_http_json($upstreamStreamUrl, [], 'GET', 4);
-                    if (!empty($uRes['streams']) && is_array($uRes['streams'])) {
-                        foreach ($uRes['streams'] as $uStream) {
-                            if (is_array($uStream) && (!empty($uStream['url']) || !empty($uStream['infoHash']) || !empty($uStream['externalUrl']))) {
-                                $streams[] = $uStream;
-                            }
+            } catch (\Throwable $e) {
+                // Upstream timed out or failed — never block stream list delivery
+            }
+        } elseif (!empty($upstreamUrls) && empty($streams)) {
+            // Only probe upstream sequentially if Amp was unavailable AND no local streams were found
+            foreach ($upstreamUrls as $upstreamStreamUrl) {
+                $uRes = fd_http_json($upstreamStreamUrl, [], 'GET', 3);
+                if (!empty($uRes['streams']) && is_array($uRes['streams'])) {
+                    foreach ($uRes['streams'] as $uStream) {
+                        if (is_array($uStream) && (!empty($uStream['url']) || !empty($uStream['infoHash']) || !empty($uStream['externalUrl']))) {
+                            $streams[] = $uStream;
                         }
                     }
                 }
@@ -13493,17 +13745,23 @@ if ($isNuvioRoute) {
             ]);
         }
 
-        // Save to stream cache ONLY if real playable streams were found.
-        // NEVER cache "no stream found" so newly indexed files or resolved streams appear immediately.
-        if ($hasPlayableStreams && !empty($streamCacheFile)) {
+        // Save to stream cache. Real playable streams cached with 300s TTL; empty streams short-cached for 60s
+        if (!empty($streamCacheFile)) {
             @file_put_contents($streamCacheFile, json_encode(['streams' => $streams], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+        }
+        $streamElapsedMs = round((microtime(true) - $streamStart) * 1000);
+        fd_log('stremio stream response ready', [
+            'itemType' => $itemType,
+            'itemId' => $itemId,
+            'elapsed_ms' => $streamElapsedMs,
+            'streams_count' => count($streams),
+            'has_playable' => $hasPlayableStreams,
+        ]);
+
+        if ($hasPlayableStreams) {
             fd_stremio_json(['streams' => $streams], 200, 'max-age=300, public');
         } else {
-            // If no playable streams, ensure any existing cache file is deleted
-            if (!empty($streamCacheFile) && is_file($streamCacheFile)) {
-                @unlink($streamCacheFile);
-            }
-            // Send no-cache headers so client/Stremio does not cache empty/no stream response
+            // Send no-cache headers so client/Stremio does not permanently cache, but server absorbs 60s stampedes
             fd_stremio_json(['streams' => $streams], 200, 'no-cache, no-store, must-revalidate');
         }
     }
@@ -15391,6 +15649,16 @@ if (PHP_SAPI === 'cli' || PHP_SAPI === 'phpdbg') {
         if (!empty($codes)) {
             fd_warmup_resolve_batch($codes, $cliBotId, 40, $cliContext);
         }
+        exit(0);
+    }
+    if ($cliAction === 'provision') {
+        fd_log('cli background guest provisioning started');
+        $provResult = fd_auto_provision_guest();
+        fd_log('cli background guest provisioning finished', [
+            'ok' => (!empty($provResult['bot_id'])) ? 1 : 0,
+            'bot_id' => $provResult['bot_id'] ?? null,
+            'error' => $provResult['error'] ?? null,
+        ]);
         exit(0);
     }
     return true;
