@@ -2923,12 +2923,33 @@ function fd_resolve_external_media_metadata(string $itemId, string $itemType = '
 }
 
 
-function fd_resolve_shortcode_cached(string $shortCode, string $botId): ?array
+function fd_resolve_cache_store(?string $key = null, ?array $value = null, bool $delete = false): ?array
 {
     static $memoryCache = [];
+    if ($delete) {
+        if ($key !== null) {
+            unset($memoryCache[$key]);
+        } else {
+            $memoryCache = [];
+        }
+        return null;
+    }
+    if ($key === null) {
+        return null;
+    }
+    if ($value !== null) {
+        $memoryCache[$key] = $value;
+        return $value;
+    }
+    return $memoryCache[$key] ?? null;
+}
+
+function fd_resolve_shortcode_cached(string $shortCode, string $botId): ?array
+{
     $cacheKey = $shortCode . ':' . $botId;
-    if (isset($memoryCache[$cacheKey])) {
-        return $memoryCache[$cacheKey];
+    $mem = fd_resolve_cache_store($cacheKey);
+    if ($mem !== null) {
+        return $mem;
     }
 
     $diskCacheFile = fd_cache_path('resolve_cache_' . md5($cacheKey) . '.json');
@@ -2940,7 +2961,7 @@ function fd_resolve_shortcode_cached(string $shortCode, string $botId): ?array
             if ($cachedRaw) {
                 $cachedJson = json_decode($cachedRaw, true);
                 if (is_array($cachedJson) && (!empty($cachedJson['file_id_mt']) || !empty($cachedJson['file_id']))) {
-                    $memoryCache[$cacheKey] = $cachedJson;
+                    fd_resolve_cache_store($cacheKey, $cachedJson);
                     return $cachedJson;
                 }
             }
@@ -2954,8 +2975,60 @@ function fd_resolve_shortcode_cached(string $shortCode, string $botId): ?array
 function fd_save_resolve_cache(string $shortCode, string $botId, array $data): void
 {
     $cacheKey = $shortCode . ':' . $botId;
+    fd_resolve_cache_store($cacheKey, $data);
     $diskCacheFile = fd_cache_path('resolve_cache_' . md5($cacheKey) . '.json');
     @file_put_contents($diskCacheFile, json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+}
+
+function fd_invalidate_resolve_cache(string $shortCode, string $botId): void
+{
+    $cacheKey = $shortCode . ':' . $botId;
+    fd_resolve_cache_store($cacheKey, null, true);
+    $diskCacheFile = fd_cache_path('resolve_cache_' . md5($cacheKey) . '.json');
+    @unlink($diskCacheFile);
+    $freshMemoFile = fd_cache_path('resolve_cache_fresh_' . md5($cacheKey) . '.json');
+    @unlink($freshMemoFile);
+}
+
+/**
+ * Resolves a short_code with the cache bypassed (force=1&nocache=1) — the file-reference refresh —
+ * memoised for a few seconds. Port of the native server's freshResolveMemo
+ * (FRESH_RESOLVE_MEMO_MS = 10 s, NativeHttpServer.resolveFreshFileId).
+ *
+ * A failed download makes every in-flight range request for the same short_code refresh its file
+ * reference at the same moment, because the player opens several range requests at once. Each of
+ * those then pays a full `resolve-file?force=1&nocache=1` (measured there: 0.5-25 s when the
+ * resolver is busy, plus the retry polling in fd_resolve_shortcode) before its first byte. One
+ * refresh is enough — the reference bytes belong to the account, not to the request.
+ *
+ * On disk rather than a static, because with FrankenPHP each concurrent range request can land in
+ * a different worker and a static would collapse nothing. Short TTL on purpose: this collapses a
+ * burst, it is not a cache of the reference.
+ */
+function fd_resolve_shortcode_fresh(string $shortCode, string $botId): array
+{
+    // Prefixed resolve_cache_ so fd_prune_cache_files() already expires it (2h) - the 10s below is
+    // what makes it a burst-collapser, the prune only stops dead memo files from accumulating.
+    $memoFile = fd_cache_path('resolve_cache_fresh_' . md5($shortCode . ':' . $botId) . '.json');
+    $memoAge = is_file($memoFile) ? time() - (int) @filemtime($memoFile) : PHP_INT_MAX;
+    if ($memoAge < 10) {
+        $memo = json_decode((string) @file_get_contents($memoFile), true);
+        if (is_array($memo) && (!empty($memo['file_id_mt']) || !empty($memo['file_id']))) {
+            fd_log('fresh resolve memo hit - reusing the refresh', [
+                'short_code' => $shortCode,
+                'bot_id' => $botId,
+                'age_ms' => $memoAge * 1000,
+            ]);
+            return $memo;
+        }
+    }
+
+    fd_log('fresh resolve memo miss - resolving with nocache', ['short_code' => $shortCode, 'bot_id' => $botId]);
+    $res = fd_resolve_shortcode($shortCode, $botId, true);
+    if (!empty($res['file_id_mt']) || !empty($res['file_id'])) {
+        @file_put_contents($memoFile, json_encode($res, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+    }
+    return $res;
 }
 
 /**
@@ -3000,10 +3073,48 @@ function fd_resolve_shortcode_concurrent(string $shortCode, array $candidateBots
         }
     }
 
+    // One request resolves a cold code; the others wait for it instead of minting their own.
+    // A player opens several ranges at once, so a cold code is otherwise resolved by all of them at
+    // the same moment - measured with 8 simultaneous ranges on a fresh code: 3 requests minted their
+    // own reference, and the mints that lost the race came back with a reference that was already
+    // superseded, so their first download failed with FILE_REFERENCE_EXPIRED.
+    // Port of the native server's resolveInFlight (NativeHttpServer:1522): the marker is STAMPED,
+    // not locked, so a request that dies or returns early cannot wedge the key - an entry older than
+    // 25 s is ignored and the request resolves for itself.
+    $inflightFile = fd_cache_path('resolve_inflight_' . md5($shortCode) . '.txt');
+    $inflightAge = is_file($inflightFile) ? time() - (int) @filemtime($inflightFile) : PHP_INT_MAX;
+    if ($inflightAge < 25) {
+        fd_log('resolve already in flight - waiting for it', ['short_code' => $shortCode, 'age_s' => $inflightAge]);
+        $inflightDeadline = microtime(true) + 9.0;
+        while (microtime(true) < $inflightDeadline) {
+            usleep(120000);
+            foreach ($candidateBots as $bId) {
+                $inherited = fd_resolve_shortcode_cached($shortCode, $bId);
+                if ($inherited !== null) {
+                    if (empty($inherited['bot_id'])) {
+                        $inherited['bot_id'] = $bId;
+                    }
+                    fd_log('resolve inherited from the in-flight request', ['short_code' => $shortCode, 'bot_id' => $bId]);
+                    return $inherited;
+                }
+            }
+        }
+        fd_log('in-flight resolve did not land in time - resolving ourselves', ['short_code' => $shortCode]);
+    }
+    @touch($inflightFile);
+
+    // Attempt #1 stays UNFORCED on purpose (matching NativeHttpServer.kt:5527):
+    // a plain resolve id for a known short_code resolves in ~200-500ms without waking up
+    // the Telegram bot relay. If that reference is expired or bound to another account,
+    // MadelineProto's download path catches FILE_REFERENCE_EXPIRED and triggers
+    // fd_resolve_shortcode_fresh() once with the 10s memo collapser. Retries in the poll ladder
+    // stay forced so relay minting still triggers when the file is truly unpopulated.
+    $forceMint = false;
+
     // Single bot fast path
     if (count($candidateBots) === 1) {
         $bId = (string) reset($candidateBots);
-        return fd_resolve_shortcode($shortCode, $bId);
+        return fd_resolve_shortcode($shortCode, $bId, $forceMint);
     }
 
     // Race all candidate bots simultaneously. Amp is the preferred client;
@@ -3031,10 +3142,11 @@ function fd_resolve_shortcode_concurrent(string $shortCode, array $candidateBots
 
     $raceUrls = [];
     foreach ($candidateBots as $bId) {
-        $raceUrls[$bId] = FD_WP_API_BASE . '/resolve-file?' . http_build_query([
-            'short_code' => $shortCode,
-            'bot_id' => $bId,
-        ]);
+        $raceUrls[$bId] = FD_WP_API_BASE . '/resolve-file?' . http_build_query(
+            $forceMint
+                ? ['short_code' => $shortCode, 'bot_id' => $bId, 'force' => 1, 'nocache' => 1]
+                : ['short_code' => $shortCode, 'bot_id' => $bId]
+        );
     }
 
     $client = fd_get_amphp_client();
@@ -3172,20 +3284,30 @@ function fd_resolve_shortcode_concurrent(string $shortCode, array $candidateBots
     // If all bots returned 404 on the initial race, WordPress has just triggered a background
     // Telegram forward/copy relay. Telegram takes 1.5s - 4.5s to finish relaying and populate tg_file_id.
     // Poll up to 4 passes (1.2s, 1.5s, 1.5s, 1.5s) so the stream or player plays directly on first click.
+    //
+    // But "File ID not found for this request, try to Reset and enter new bot token." is WordPress
+    // refusing the code outright, not a relay still running - polling cannot fix it. Measured in the
+    // fresh-code stress run: two dead codes were polled for 59 s and 63 s before the endpoint
+    // answered 404, with the same message and the same code on every pass, from both pool bots.
     $all404 = !empty($botStatuses) && count(array_filter($botStatuses, fn($s) => ($s['http'] ?? 0) === 404)) === count($botStatuses);
-    if ($all404) {
+    $resolveNotFound = is_array($lastErrorResult)
+        && stripos((string) ($lastErrorResult['message'] ?? ''), 'not found for this request') !== false;
+    if ($resolveNotFound) {
+        fd_log('resolve: WordPress says not found - skipping the relay poll passes', ['short_code' => $shortCode]);
+    }
+    if ($all404 && !$resolveNotFound) {
         $delays = [1200000, 1500000, 1500000, 1500000]; // in microseconds (total ~5.7s max)
 
         foreach ($delays as $retryIdx => $sleepUs) {
             usleep($sleepUs);
 
             // Re-race candidate bots (Amp preferred, curl_multi fallback).
+            // Retries force nocache to mint fresh references via Telegram relay ladder.
             $retryUrls = [];
             foreach ($candidateBots as $bId) {
-                $retryUrls[$bId] = FD_WP_API_BASE . '/resolve-file?' . http_build_query([
-                    'short_code' => $shortCode,
-                    'bot_id' => $bId,
-                ]);
+                $retryUrls[$bId] = FD_WP_API_BASE . '/resolve-file?' . http_build_query(
+                    ['short_code' => $shortCode, 'bot_id' => $bId, 'force' => 1, 'nocache' => 1]
+                );
             }
 
             $ampRetry = fd_http_get_many_amp($retryUrls, ['headers' => $headers, 'timeout' => 6]);
@@ -3315,13 +3437,24 @@ function fd_resolve_shortcode(string $shortCode, string $botId = '', bool $bypas
         return $res;
     }
 
+    // A definitive "not found for this request" is WordPress refusing the code - polling cannot fix
+    // it, so answer now instead of sleeping through the relay poll below.
+    if (stripos((string) ($res['message'] ?? ''), 'not found for this request') !== false) {
+        return $res;
+    }
+
     // If 404, Telegram background relay was just triggered; poll up to 3 times (1.2s, 1.5s, 1.5s)
+    // Retries force nocache to wake up relay minting (matching NativeHttpServer ladder)
     $delays = [1200000, 1500000, 1500000];
+    $retryParams = array_merge($params, ['force' => 1, 'nocache' => 1]);
     foreach ($delays as $delayUs) {
         usleep($delayUs);
-        $res = fd_http_json($url, $params, 'GET', 6);
+        $res = fd_http_json($url, $retryParams, 'GET', 6);
         if (!empty($res['file_id_mt']) || !empty($res['file_id'])) {
             fd_save_resolve_cache($shortCode, $botId, $res);
+            return $res;
+        }
+        if (stripos((string) ($res['message'] ?? ''), 'not found for this request') !== false) {
             return $res;
         }
     }
@@ -3471,6 +3604,7 @@ function fd_spawn_warmup_resolve(array $shortCodes, string $botId = '', string $
 
     return true;
 }
+
 
 function fd_resolve_shortcodes_batch(array $shortCodes, string $botId = '', string $context = ''): array
 {
@@ -6139,6 +6273,11 @@ function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, s
     if ($searchedYear !== '') {
         $cleanTarget = preg_replace('/\b' . preg_quote($searchedYear, '/') . '\b/', ' ', $cleanTarget);
     }
+    $noAposTarget = preg_replace("/['’`]/u", '', $cleanTarget);
+    $noAposTarget = preg_replace('/\b(\w+)\s+s\b/iu', '$1s', $noAposTarget);
+    $noAposTarget = trim(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $noAposTarget));
+    $noAposLower = strtolower(trim(preg_replace('/\s+/', ' ', $noAposTarget)));
+
     $cleanTarget = trim(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $cleanTarget));
     $cleanTarget = trim(preg_replace('/\s+/', ' ', $cleanTarget));
     $targetLower = strtolower($cleanTarget);
@@ -6150,6 +6289,7 @@ function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, s
     // Prepare AKA target if provided
     $akaLower = '';
     $akaNoThe = '';
+    $noAposAkaLower = '';
     if ($searchedAka !== '') {
         $cleanAka = preg_replace('/\s*[•··]\s*.+$/u', '', fd_clean_html_entities($searchedAka));
         $cleanAka = preg_replace('/\s*&\s*/', ' and ', $cleanAka);
@@ -6157,6 +6297,11 @@ function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, s
         if ($searchedYear !== '') {
             $cleanAka = preg_replace('/\b' . preg_quote($searchedYear, '/') . '\b/', ' ', $cleanAka);
         }
+        $noAposAka = preg_replace("/['’`]/u", '', $cleanAka);
+        $noAposAka = preg_replace('/\b(\w+)\s+s\b/iu', '$1s', $noAposAka);
+        $noAposAka = trim(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $noAposAka));
+        $noAposAkaLower = strtolower(trim(preg_replace('/\s+/', ' ', $noAposAka)));
+
         $cleanAka = trim(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $cleanAka));
         $cleanAka = trim(preg_replace('/\s+/', ' ', $cleanAka));
         $akaLower = strtolower($cleanAka);
@@ -6179,7 +6324,7 @@ function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, s
             }
             $baseCap = preg_replace('/\b(?:extended(?:\s*cut)?|directors?\s*cut|unrated|imax|special\s*edition|remastered|criterion|sub\s*malay|malay\s*sub|eng\s*sub|sub\s*eng|indosub|sub\s*indo|subtitle|dubbed|multi\s*audio|clean\s*audio|hc|hardsub)\b.*/i', '', $baseCap);
             $baseCap = trim(preg_replace('/\s+/', ' ', $baseCap));
-            if ($baseCap !== '' && ($baseCap === $targetLower || ($akaLower !== '' && $baseCap === $akaLower))) {
+            if ($baseCap !== '' && ($baseCap === $targetLower || ($noAposLower !== '' && $baseCap === $noAposLower) || ($akaLower !== '' && $baseCap === $akaLower) || ($noAposAkaLower !== '' && $baseCap === $noAposAkaLower))) {
                 if ($searchedYear !== '' && preg_match('/\b(19\d\d|20\d\d)\b/', $firstLine, $cym)) {
                     if (abs((int)$cym[1] - (int)$searchedYear) <= 1) {
                         return true;
@@ -6195,6 +6340,10 @@ function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, s
     $fClean = fd_clean_media_title($fileTitle);
     // Strip leading @channel tags or [group] tags
     $fClean = preg_replace('/^(?:@\w+[._\s]+|\[[^\]]+\][._\s]*|\([^\)]+\)[._\s]*)/i', '', $fClean);
+    // Strip leading resolution prefix (e.g. "1080.", "720.")
+    $fClean = preg_replace('/^(?:(?:\d{3,4}p?)[._\s]+)+/i', '', $fClean);
+    // Strip leading website domains (e.g. "PUSATFILM.ID.", "LK21.ORG.")
+    $fClean = preg_replace('/^(?:(?:www\.)?[a-z0-9-]+\.(?:id|com|org|net|me|tv|cc|vip|site|xyz|buzz|top|link|club|online|co|fun|pro)[._\s]+)/i', '', $fClean);
     // Strip leading release channels/groups/tags/domains
     $fClean = preg_replace('/^(?:prakytv|ngefilm\s*store|runningmovieshd|kannadachallengers|mkvcinemas|vegamovies|moviesmod|pahe|galaxy|wetv|studioghibli|animerg|anime\s*time\s*studio\s*ghibli\s*movie\s*\d*|mcu|pms|pahe\.li|layarkaca\d*|cinemaindo|indoxxi|sklink(?:\s*office)?|movie\s*king|movie\s*world|film\s*world|tamilblasters|1tamilmv|tamilmv|tamilrockers|tamilyogi|tamilgun|isaidub|kuttymovies|moviesda|bolly4u|desiremovies|worldfree4u|katmoviehd|skymovieshd|filmywap|filmyzilla|extramovies|9xmovies|movieswood|jiorockers|todaypk|cinevood|hdhub4u|dotmovies|topmovies|modmobile|uhdmovies|allmovieshub|moviesverse|luxmovie|cinemalover|flixhub|movies4u|plexmovies|moviesrocker|mkvking|psa|yts)\s+/i', '', $fClean);
     $fCleanNorm = strtolower(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $fClean));
@@ -6236,17 +6385,19 @@ function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, s
 
     // 7. Direct comparison between base filename title and target (strict: "The Runner" != "Runner")
     if ($baseF !== '') {
-        if ($baseF === $targetLower) {
+        if ($baseF === $targetLower || ($noAposLower !== '' && $baseF === $noAposLower)) {
             return true;
         }
-        if ($akaLower !== '' && $baseF === $akaLower) {
+        if ($akaLower !== '' && ($baseF === $akaLower || ($noAposAkaLower !== '' && $baseF === $noAposAkaLower))) {
             return true;
         }
 
         // Check if baseF ends with targetLower preceded by known uploader/channel/site words
         // e.g. "sklink office baththa" ends with "baththa", prefix is "sklink office"
         $targetsToCheck = [$targetLower];
+        if ($noAposLower !== '' && $noAposLower !== $targetLower) $targetsToCheck[] = $noAposLower;
         if ($akaLower !== '') $targetsToCheck[] = $akaLower;
+        if ($noAposAkaLower !== '' && $noAposAkaLower !== $akaLower) $targetsToCheck[] = $noAposAkaLower;
         foreach ($targetsToCheck as $tgt) {
             if (str_ends_with($baseF, ' ' . $tgt)) {
                 $prefix = trim(substr($baseF, 0, -strlen($tgt)));
@@ -6269,6 +6420,24 @@ function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, s
         str_replace(' dan ', ' ', $targetLower),
         rtrim($targetLower, 's'),
     ];
+    $collapsedSTarget = preg_replace('/\b(\w+)\s+s\b/iu', '$1s', $targetLower);
+    $expandedSTarget  = preg_replace('/\b(\w+)s\b/iu', '$1 s', $targetLower);
+    if ($collapsedSTarget !== '' && $collapsedSTarget !== $targetLower) {
+        $targetVariants[] = $collapsedSTarget;
+        $targetVariants[] = rtrim($collapsedSTarget, 's');
+    }
+    if ($expandedSTarget !== '' && $expandedSTarget !== $targetLower) {
+        $targetVariants[] = $expandedSTarget;
+    }
+
+    if ($noAposLower !== '' && $noAposLower !== $targetLower) {
+        $targetVariants[] = $noAposLower;
+        $targetVariants[] = str_replace(' and ', ' dan ', $noAposLower);
+        $targetVariants[] = str_replace(' dan ', ' and ', $noAposLower);
+        $targetVariants[] = str_replace(' and ', ' ', $noAposLower);
+        $targetVariants[] = str_replace(' dan ', ' ', $noAposLower);
+        $targetVariants[] = rtrim($noAposLower, 's');
+    }
     if (in_array($baseF, $targetVariants, true)) {
         return true;
     }
@@ -6292,6 +6461,15 @@ function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, s
             $fWords = array_values(array_filter(explode(' ', $baseF), fn($w) => strlen($w) > 1));
             if ($fWords === $targetWords) {
                 return true;
+            }
+        }
+        if ($noAposLower !== '') {
+            $noAposWords = array_values(array_filter(explode(' ', $noAposLower), fn($w) => strlen($w) > 1));
+            if (count($noAposWords) >= 2) {
+                $fWords = array_values(array_filter(explode(' ', $baseF), fn($w) => strlen($w) > 1));
+                if ($fWords === $noAposWords) {
+                    return true;
+                }
             }
         }
     }
@@ -6330,17 +6508,7 @@ function fd_series_file_matches_title(string $fileTitle, string $seriesTitle, in
         return true;
     }
 
-    // 2. Strict Year check if year is specified on the series and present on the file
-    $hasFileYear = (bool) preg_match('/\b(19\d\d|20\d\d)\b/', $fileTitle, $fym);
-    if ($seriesYear !== '' && $hasFileYear) {
-        $fileYear = (int) $fym[1];
-        $targetYear = (int) $seriesYear;
-        if (abs($fileYear - $targetYear) > 1) {
-            return false;
-        }
-    }
-
-    // 3. Normalize series title
+    // 2. Normalize series title
     $cleanSeries = preg_replace('/\s*[•··]\s*.+$/u', '', fd_clean_html_entities($seriesTitle));
     $cleanSeries = preg_replace('/\b(?:tvseries|series|season|musim|drama|episode|bahagian)\b.*/i', '', $cleanSeries);
     if ($seriesYear !== '') {
@@ -6354,10 +6522,24 @@ function fd_series_file_matches_title(string $fileTitle, string $seriesTitle, in
     }
     $targetNoThe = trim(preg_replace('/^the\s+/i', '', $targetLower));
 
+    $stopWords = ['the', 'a', 'an', 'of', 'in', 'on', 'at', 'to', 'for', 'and', 'dan'];
+    $contentWords = array_values(array_filter(explode(' ', $targetLower), fn($w) => !in_array($w, $stopWords, true)));
+    $isSingleWord = count($contentWords) <= 1;
+
+    // 3. Strict Year check if year is specified on the series and present on the file
+    $hasFileYear = (bool) preg_match('/\b(19\d\d|20\d\d)\b/', $fileTitle, $fym);
+    if ($seriesYear !== '' && $hasFileYear) {
+        $fileYear = (int) $fym[1];
+        $targetYear = (int) $seriesYear;
+        if ($isSingleWord ? ($fileYear !== $targetYear) : (abs($fileYear - $targetYear) > 1)) {
+            return false;
+        }
+    }
+
     // 4. Extract series title portion from filename
     $fClean = preg_replace('/\.(mp4|mkv|avi|mov|ts|flv|webm)$/i', '', $fileTitle);
     $fClean = fd_clean_media_title($fClean);
-    $fClean = preg_replace('/^(?:prakytv|ngefilm\s*store|runningmovieshd|kannadachallengers|mkvcinemas|vegamovies|moviesmod|pahe|galaxy|wetv|studioghibli|animerg|pms|pahe\.li|layarkaca\d*|cinemaindo|indoxxi|kdg|fanszz|dramaost|mkvdrama|dusklight|primefix|nodrakorid|nodrakor|layarasia|old|oppa\.biz|drakor\s*id)\s+/i', '', $fClean);
+    $fClean = preg_replace('/^(?:prakytv|ngefilm\s*store|runningmovieshd|kannadachallengers|mkvcinemas|vegamovies|moviesmod|pahe|galaxy|wetv|studioghibli|animerg|pms|pahe\.li|layarkaca\d*|cinemaindo|indoxxi|kdg|fanszz|dramaost|mkvdrama|dusklight|primefix|nodrakorid|nodrakor|layarasia|old|oppa\.biz|drakor\s*id|nunadrama|queendramainfo|adrama(?:\s*lovers)?)\s+/i', '', $fClean);
     $fCleanNorm = strtolower(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $fClean));
     $fCleanNorm = trim(preg_replace('/\s+/', ' ', $fCleanNorm));
 
@@ -6384,16 +6566,39 @@ function fd_series_file_matches_title(string $fileTitle, string $seriesTitle, in
     $afterEpNoThe = trim(preg_replace('/^the\s+/i', '', $afterEp));
 
     // 5. Check leading "The " compatibility
+    // "The Glory" is NOT the same show as "Glory" — distinct shows on WordPress and TV networks.
     $hasLeadingThe = str_starts_with($targetLower, 'the ');
     $fileHasLeadingThe = str_starts_with($baseF, 'the ') || str_starts_with($afterEp, 'the ');
-    if (!$hasLeadingThe && $fileHasLeadingThe) {
-        if ($seriesYear !== '' && preg_match('/\b(2022|2023|2024|korean|korea|k\.o|netflix|\bnf\b|rarbg)\b/i', $fileTitle)) {
+    if ($hasLeadingThe !== $fileHasLeadingThe) {
+        return false;
+    }
+
+    // For single-word titles with known year (e.g. "Glory 2025"), reject un-yeared files that have foreign platform/region indicators
+    if (!$hasFileYear && $seriesYear !== '' && $isSingleWord) {
+        if (preg_match('/\b(netflix|\bnf\b|k\.o|korean|korea|rarbg|kdg|hindi)\b/i', $fileTitle . ' ' . $fileCaption)) {
             return false;
         }
     }
 
     // 6. Compare extracted title candidates with target series title
-    $candidates = array_filter([$baseF, $baseFNoThe, $afterEp, $afterEpNoThe], fn($c) => $c !== '');
+    $candidates = array_filter([$baseF, $afterEp], fn($c) => $c !== '');
+    foreach ([$targetLower, $targetNoThe] as $tgt) {
+        if ($tgt === '') continue;
+        if (str_ends_with($baseF, ' ' . $tgt)) {
+            $prefix = trim(substr($baseF, 0, -strlen($tgt)));
+            if ($prefix !== '' && preg_match('/^(?:(?:sklink|office|movie|movies|king|film|films|cinema|cinemas|media|channel|tv|tele|tg|hub|world|zone|group|team|club|gang|bot|vip|official|download|downloads|upload|uploads|site|store|station|blasters|rockers|wap|villa|dub|yogi|verse|flix|pahe|galaxy|pms|mkv|link|links|hd|nunadrama|drakor|drama|adrama|lovers|queendramainfo)\b\s*)+$/i', $prefix)) {
+                $candidates[] = $tgt;
+            }
+        }
+        if ($afterEp !== '' && str_ends_with($afterEp, ' ' . $tgt)) {
+            $prefix = trim(substr($afterEp, 0, -strlen($tgt)));
+            if ($prefix !== '' && preg_match('/^(?:(?:sklink|office|movie|movies|king|film|films|cinema|cinemas|media|channel|tv|tele|tg|hub|world|zone|group|team|club|gang|bot|vip|official|download|downloads|upload|uploads|site|store|station|blasters|rockers|wap|villa|dub|yogi|verse|flix|pahe|galaxy|pms|mkv|link|links|hd|nunadrama|drakor|drama|adrama|lovers|queendramainfo)\b\s*)+$/i', $prefix)) {
+                $candidates[] = $tgt;
+            }
+        }
+    }
+    $candidates = array_values(array_unique($candidates));
+
     $targetVariants = [
         $targetLower,
         $targetNoThe,
@@ -6408,8 +6613,11 @@ function fd_series_file_matches_title(string $fileTitle, string $seriesTitle, in
         if (in_array($c, $targetVariants, true)) {
             return true;
         }
-        if (str_starts_with($c, $targetLower . ' ') || ($targetNoThe !== '' && str_starts_with($c, $targetNoThe . ' '))) {
-            return true;
+        if (!$isSingleWord && (str_starts_with($c, $targetLower . ' ') || ($targetNoThe !== '' && str_starts_with($c, $targetNoThe . ' ')))) {
+            $suffix = trim(substr($c, strlen($targetLower)));
+            if (preg_match('/^(?:part|vol|volume|chapter|season|musim|bahagian)\s*\d+$/i', $suffix)) {
+                return true;
+            }
         }
     }
 
@@ -6656,6 +6864,35 @@ function fd_fetch_post_files_paged(int $postId, array $opts = []): array
         }
 
         if ($untilUnique) {
+            if (!empty($seenEps)) {
+                $epsBySeason = [];
+                foreach (array_keys($seenEps) as $epKey) {
+                    $parts = explode('_', $epKey);
+                    $s = (int) ($parts[0] ?? 1);
+                    $e = (int) ($parts[1] ?? 0);
+                    if ($e > 0) {
+                        $epsBySeason[$s][$e] = true;
+                    }
+                }
+                $complete = !empty($epsBySeason);
+                foreach ($epsBySeason as $epMap) {
+                    $maxE = max(array_keys($epMap));
+                    if ($maxE <= 0) {
+                        $complete = false;
+                        break;
+                    }
+                    for ($ck = 1; $ck <= $maxE; $ck++) {
+                        if (empty($epMap[$ck])) {
+                            $complete = false;
+                            break;
+                        }
+                    }
+                    if (!$complete) break;
+                }
+                if ($complete) {
+                    break;
+                }
+            }
             if ($newEpsThisPage === 0) {
                 $stalePages++;
             } else {
@@ -6685,7 +6922,8 @@ function fd_stream_keyword_from_post_title(string $title): string
     $keyword = trim((string) preg_replace('/\s*\(\d{4}\)\s*$/u', '', $keyword));
     $keyword = trim((string) preg_replace('/\s+\d{4}\s*$/u', '', $keyword));
     $keyword = trim((string) preg_replace('/\b(?:tvseries|tv\s*series|movie)\b/iu', '', $keyword));
-    return trim((string) preg_replace('/\s+/', ' ', $keyword));
+    $keyword = trim((string) preg_replace('/\s+/', ' ', $keyword));
+    return trim($keyword, " \t\n\r\0\x0B.!?:;,-");
 }
 
 /**
@@ -7146,7 +7384,7 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
  * "COMBINED" season packs while the real per-episode files live elsewhere
  * in the Telegram database).
  */
-function fd_fetch_series_episode_files(int $postId): array
+function fd_fetch_series_episode_files(int $postId, ?array $preloadedPost = null): array
 {
     $all = fd_fetch_post_files_paged($postId, [
         'page_size' => 200,
@@ -7194,15 +7432,15 @@ function fd_fetch_series_episode_files(int $postId): array
         }
     }
 
-    // If explicit episodes exist and there are no missing episode gaps, post files are complete.
-    if ($hasExplicitEp && !$hasGaps) {
+    // If explicit episodes exist, post files are sufficient for metadata.
+    if ($hasExplicitEp) {
         return $all;
     }
 
     // Either no explicit episodes (combined packs) or missing episode gaps in the post's files:
     // search for individual episode files by title keyword to backfill missing episodes.
-    $postData = fd_fetch_stream_ajax('get_post', ['post_id' => $postId]);
-    $post = !empty($postData) && is_array($postData) ? ($postData[0] ?? $postData) : [];
+    $post = $preloadedPost ?: fd_fetch_stream_ajax('get_post', ['post_id' => $postId]);
+    $post = !empty($post) && is_array($post) ? ($post[0] ?? $post) : [];
     $keyword = fd_stream_keyword_from_post_title((string) ($post['title'] ?? ''));
     if ($keyword === '') {
         return $all;
@@ -8149,15 +8387,49 @@ function fd_get_trending_keywords_map(): array
     $cacheFile = fd_cache_path('trending_keywords.json');
     $ttl = 600; // 10 minutes
 
-    if (is_file($cacheFile) && (time() - (int) filemtime($cacheFile)) < $ttl) {
+    $readCache = static function () use ($cacheFile): array {
+        if (!is_file($cacheFile)) {
+            return [];
+        }
         $data = json_decode((string) @file_get_contents($cacheFile), true);
-        if (is_array($data) && !empty($data)) {
-            return $memoryCached = $data;
+        return (is_array($data) && !empty($data)) ? $data : [];
+    };
+
+    // Fresh cache: serve it immediately
+    if (is_file($cacheFile) && (time() - (int) filemtime($cacheFile)) < $ttl) {
+        $cached = $readCache();
+        if (!empty($cached)) {
+            return $memoryCached = $cached;
         }
     }
 
-    $cached = [];
+    // Cold/stale cache: single-flight refresh without blocking manifest requests
+    $lockFile = fd_cache_path('trending_keywords.lock');
+    $lockFp = @fopen($lockFile, 'c');
+    $isRefresher = false;
+    if ($lockFp) {
+        $isRefresher = @flock($lockFp, LOCK_EX | LOCK_NB);
+    }
+
+    if (!$isRefresher) {
+        if ($lockFp) {
+            @fclose($lockFp);
+        }
+        $stale = $readCache();
+        if (!empty($stale)) {
+            return $memoryCached = $stale;
+        }
+    }
+
     try {
+        if (is_file($cacheFile) && (time() - (int) filemtime($cacheFile)) < $ttl) {
+            $cached = $readCache();
+            if (!empty($cached)) {
+                return $memoryCached = $cached;
+            }
+        }
+
+        $cached = [];
         $trending = fd_fetch_stream_ajax('trending', ['limit' => 15]);
         if (is_array($trending)) {
             foreach ($trending as $item) {
@@ -8172,18 +8444,18 @@ function fd_get_trending_keywords_map(): array
         }
         if (!empty($cached)) {
             @file_put_contents($cacheFile, json_encode($cached, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+            return $memoryCached = $cached;
         }
     } catch (\Throwable $e) {
-    }
-
-    if (empty($cached) && is_file($cacheFile)) {
-        $stale = json_decode((string) @file_get_contents($cacheFile), true);
-        if (is_array($stale) && !empty($stale)) {
-            return $memoryCached = $stale;
+    } finally {
+        if ($lockFp) {
+            @flock($lockFp, LOCK_UN);
+            @fclose($lockFp);
         }
     }
 
-    return $memoryCached = $cached;
+    $stale = $readCache();
+    return $memoryCached = (!empty($stale) ? $stale : []);
 }
 
 /**
@@ -11154,6 +11426,44 @@ if ($isNuvioRoute) {
 
     // ── Nuvio / Stremio Manifest ──
     if ($addonPath === '/manifest.json') {
+        $settingsFile = fd_storage_path('storage/catalog_settings.json');
+        $trendingFile = fd_cache_path('trending_keywords.json');
+        $mKeyParts = (string)($_SERVER['HTTP_HOST'] ?? '') . '_' .
+            (string)($_SERVER['HTTP_X_FORWARDED_HOST'] ?? '') . '_' .
+            (string)($_GET['mode'] ?? '') . '_' .
+            (is_file($settingsFile) ? filemtime($settingsFile) : 0) . '_' .
+            (is_file($trendingFile) ? filemtime($trendingFile) : 0);
+        $manifestCacheFile = fd_cache_path('manifest_cache_' . md5($mKeyParts) . '.json');
+
+        if (is_file($manifestCacheFile) && (time() - (int) filemtime($manifestCacheFile)) < 1800) {
+            $cachedJson = (string) @file_get_contents($manifestCacheFile);
+            if ($cachedJson !== '') {
+                $etag = '"' . md5($cachedJson) . '"';
+                $cleanClientEtag = trim((string) ($_SERVER['HTTP_IF_NONE_MATCH'] ?? ''), '"\' ');
+                $cleanCurrentEtag = trim($etag, '"\' ');
+                if ($cleanClientEtag !== '' && $cleanClientEtag === $cleanCurrentEtag) {
+                    if (!headers_sent()) {
+                        http_response_code(304);
+                        header('ETag: ' . $etag);
+                        header('Cache-Control: max-age=1800, stale-while-revalidate=3600');
+                        header('Access-Control-Allow-Origin: *');
+                    }
+                    exit;
+                }
+                if (!headers_sent()) {
+                    http_response_code(200);
+                    header('Content-Type: application/json; charset=utf-8');
+                    header('Access-Control-Allow-Origin: *');
+                    header('Access-Control-Allow-Methods: GET, OPTIONS');
+                    header('Access-Control-Allow-Headers: *');
+                    header('Cache-Control: max-age=1800, stale-while-revalidate=3600');
+                    header('ETag: ' . $etag);
+                }
+                echo $cachedJson;
+                exit;
+            }
+        }
+
         // Fetch genre list from WordPress (matching public/app.js).
         // Cached to disk: this is a blocking remote call (12s timeout) and
         // /manifest.json is fetched by every client on every install/refresh.
@@ -11277,7 +11587,6 @@ if ($isNuvioRoute) {
                 'type' => 'movie',
                 'id' => 'top',
                 'name' => 'Popular',
-                'genres' => $allGenreOptions,
                 'extra' => [
                     ['name' => 'search', 'isRequired' => false],
                     ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
@@ -11290,7 +11599,6 @@ if ($isNuvioRoute) {
                 'type' => 'movie',
                 'id' => 'year',
                 'name' => 'New',
-                'genres' => $allYearOptions,
                 'extra' => [
                     ['name' => 'genre', 'options' => $allYearOptions, 'isRequired' => true],
                     ['name' => 'skip', 'isRequired' => false],
@@ -11302,7 +11610,6 @@ if ($isNuvioRoute) {
                 'type' => 'movie',
                 'id' => 'pm_search_movie',
                 'name' => 'Search Movies',
-                'genres' => $allGenreOptions,
                 'extra' => [
                     ['name' => 'search', 'isRequired' => true],
                     ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
@@ -11320,7 +11627,6 @@ if ($isNuvioRoute) {
                 'type' => 'movie',
                 'id' => $catId,
                 'name' => $catName,
-                'genres' => $filterOptionsCombined,
                 'extra' => [
                     ['name' => 'genre', 'options' => $filterOptionsCombined, 'isRequired' => false],
                     ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
@@ -11335,7 +11641,6 @@ if ($isNuvioRoute) {
             'type' => 'series',
             'id' => 'top',
             'name' => 'Popular',
-            'genres' => $allGenreOptions,
             'extra' => [
                 ['name' => 'search', 'isRequired' => false],
                 ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
@@ -11348,7 +11653,6 @@ if ($isNuvioRoute) {
             'type' => 'series',
             'id' => 'pm_series_year',
             'name' => 'New',
-            'genres' => $allYearOptions,
             'extra' => [
                 ['name' => 'genre', 'options' => $allYearOptions, 'isRequired' => true],
                 ['name' => 'skip', 'isRequired' => false],
@@ -11360,7 +11664,6 @@ if ($isNuvioRoute) {
             'type' => 'series',
             'id' => 'pm_search_series',
             'name' => 'Search Series',
-            'genres' => $allGenreOptions,
             'extra' => [
                 ['name' => 'search', 'isRequired' => true],
                 ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
@@ -11377,7 +11680,6 @@ if ($isNuvioRoute) {
                 'type' => 'series',
                 'id' => $catId,
                 'name' => $catName,
-                'genres' => $filterOptionsCombined,
                 'extra' => [
                     ['name' => 'genre', 'options' => $filterOptionsCombined, 'isRequired' => false],
                     ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
@@ -11392,7 +11694,6 @@ if ($isNuvioRoute) {
             'type' => 'other',
             'id' => 'top',
             'name' => 'Telegram Files',
-            'genres' => $allYearOptions,
             'extra' => [
                 ['name' => 'search', 'isRequired' => false],
                 ['name' => 'genre', 'options' => $allYearOptions, 'isRequired' => false],
@@ -11404,7 +11705,6 @@ if ($isNuvioRoute) {
             'type' => 'other',
             'id' => 'pm_files_year',
             'name' => 'New',
-            'genres' => $allYearOptions,
             'extra' => [
                 ['name' => 'genre', 'options' => $allYearOptions, 'isRequired' => true],
                 ['name' => 'skip', 'isRequired' => false],
@@ -11416,7 +11716,6 @@ if ($isNuvioRoute) {
             'type' => 'other',
             'id' => 'pm_search_files',
             'name' => 'Telegram Files',
-            'genres' => $allYearOptions,
             'extra' => [
                 ['name' => 'search', 'isRequired' => true],
                 ['name' => 'genre', 'options' => $allYearOptions, 'isRequired' => false],
@@ -11433,7 +11732,6 @@ if ($isNuvioRoute) {
                 'type' => 'other',
                 'id' => $catId,
                 'name' => ucwords($kw),
-                'genres' => ['4K', '1080p', '720p', 'BluRay', 'WEB-DL', 'HEVC'],
                 'extra' => [
                     ['name' => 'genre', 'options' => ['4K', '1080p', '720p', 'BluRay', 'WEB-DL', 'HEVC'], 'isRequired' => false],
                     ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
@@ -11544,9 +11842,6 @@ if ($isNuvioRoute) {
                         'id'   => $bridgeCatId,
                         'name' => ($uCat['name'] ?? 'Catalog') . " ({$mName})",
                     ];
-                    if (!empty($uCat['genres']) && is_array($uCat['genres'])) {
-                        $bridgeCat['genres'] = $uCat['genres'];
-                    }
                     if (!empty($uCat['extra']) && is_array($uCat['extra'])) {
                         $trimmedExtra = [];
                         foreach ($uCat['extra'] as $ex) {
@@ -11624,7 +11919,27 @@ if ($isNuvioRoute) {
             ],
         ];
 
-        fd_stremio_json($manifest, 200, 'no-cache, no-store, must-revalidate');
+        $jsonBytes = json_encode($manifest, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        if (!empty($manifestCacheFile) && $jsonBytes !== false) {
+            @file_put_contents($manifestCacheFile, $jsonBytes, LOCK_EX);
+        }
+        $etag = '"' . md5($jsonBytes) . '"';
+        $cleanClientEtag = trim((string) ($_SERVER['HTTP_IF_NONE_MATCH'] ?? ''), '"\' ');
+        $cleanCurrentEtag = trim($etag, '"\' ');
+        if ($cleanClientEtag !== '' && $cleanClientEtag === $cleanCurrentEtag) {
+            if (!headers_sent()) {
+                http_response_code(304);
+                header('ETag: ' . $etag);
+                header('Cache-Control: max-age=1800, stale-while-revalidate=3600');
+                header('Access-Control-Allow-Origin: *');
+            }
+            exit;
+        }
+        if (!headers_sent()) {
+            header('ETag: ' . $etag);
+        }
+
+        fd_stremio_json($manifest, 200, 'max-age=1800, stale-while-revalidate=3600');
     }
 
     // ── Nuvio Catalog: /catalog/:type/:id[/:extra].json ──
@@ -11863,6 +12178,26 @@ if ($isNuvioRoute) {
                             $fileMetaItem['releaseInfo'] = $fReleaseYear;
                         }
                         $metas[] = $fileMetaItem;
+
+                        // Pre-seed meta cache for direct file (instant 0ms click in Stremio/Nuvio)
+                        $fileMetaCacheFile = fd_cache_path('meta_cache_' . md5('file_' . $fCode) . '.json');
+                        if (!is_file($fileMetaCacheFile)) {
+                            $fullFileMeta = [
+                                'meta' => [
+                                    'id' => 'pm_file_' . $fCode,
+                                    'type' => $catalogType !== '' ? $catalogType : 'other',
+                                    'name' => $fTitle,
+                                    'poster' => $fThumb,
+                                    'posterShape' => 'poster',
+                                    'background' => $fThumb,
+                                    'logo' => $fThumb,
+                                    'description' => "⚡ Direct Telegram Cloud File\n" . $pillLine . "\n\n📄 File: " . $fTitle,
+                                    'genres' => $genres,
+                                    'releaseInfo' => $fReleaseYear,
+                                ]
+                            ];
+                            @file_put_contents($fileMetaCacheFile, json_encode($fullFileMeta, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+                        }
                     }
                 }
             }
@@ -11941,7 +12276,7 @@ if ($isNuvioRoute) {
                         default => "⚡ Direct Telegram File",
                     };
 
-                    $metas[] = [
+                    $fileMetaItem = [
                         'id' => 'pm_file_' . $fCode,
                         'type' => 'other',
                         'name' => $fTitle,
@@ -11950,6 +12285,27 @@ if ($isNuvioRoute) {
                         'description' => "{$descriptionPrefix} · {$pillLine}\n\n{$fTitle}",
                         'genres' => $genres,
                     ];
+                    $metas[] = $fileMetaItem;
+
+                    // Pre-seed meta cache for direct file
+                    $fileMetaCacheFile = fd_cache_path('meta_cache_' . md5('file_' . $fCode) . '.json');
+                    if (!is_file($fileMetaCacheFile)) {
+                        $fullFileMeta = [
+                            'meta' => [
+                                'id' => 'pm_file_' . $fCode,
+                                'type' => 'other',
+                                'name' => $fTitle,
+                                'poster' => $fThumb,
+                                'posterShape' => 'poster',
+                                'background' => $fThumb,
+                                'logo' => $fThumb,
+                                'description' => "{$descriptionPrefix} · {$pillLine}\n\n📄 File: " . $fTitle,
+                                'genres' => $genres,
+                                'releaseInfo' => $year,
+                            ]
+                        ];
+                        @file_put_contents($fileMetaCacheFile, json_encode($fullFileMeta, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+                    }
                 }
             }
         } else {
@@ -12062,6 +12418,34 @@ if ($isNuvioRoute) {
                         $metaItem['releaseInfo'] = $releaseYear;
                     }
                     $metas[] = $metaItem;
+
+                    // Pre-cache post data for instant metadata resolution
+                    $postDataFile = fd_cache_path('post_data_' . $pId . '.json');
+                    if (!is_file($postDataFile)) {
+                        @file_put_contents($postDataFile, json_encode($post, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+                    }
+
+                    // Pre-seed meta cache for movie posts (instant 0ms click in Stremio/Nuvio)
+                    if ($itemType === 'movie') {
+                        $postMetaCacheFile = fd_cache_path('meta_cache_' . md5('post_' . $pId) . '.json');
+                        if (!is_file($postMetaCacheFile)) {
+                            $fullMeta = [
+                                'meta' => [
+                                    'id' => 'pm:post:' . $pId,
+                                    'type' => 'movie',
+                                    'name' => $cleanName,
+                                    'poster' => $pThumb,
+                                    'posterShape' => 'poster',
+                                    'background' => $pThumb,
+                                    'description' => fd_clean_post_plot($pExcerpt),
+                                    'genres' => $itemGenres,
+                                    'releaseInfo' => $releaseYear,
+                                    'year' => $releaseYear,
+                                ]
+                            ];
+                            @file_put_contents($postMetaCacheFile, json_encode($fullMeta, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+                        }
+                    }
                 }
             }
         }
@@ -12213,15 +12597,23 @@ if ($isNuvioRoute) {
             $hasAmp = function_exists('Amp\\async') && function_exists('Amp\\Future\\await');
             $isDirectSeriesType = ($itemType === 'series' || str_contains(strtolower($itemType), 'series'));
 
+            $postDataCacheFile = fd_cache_path('post_data_' . $postId . '.json');
+            $cachedPostData = (is_file($postDataCacheFile) && (time() - (int)filemtime($postDataCacheFile)) < 3600)
+                ? json_decode((string)@file_get_contents($postDataCacheFile), true)
+                : null;
+
             // If series is directly known from the route, fan out get_post and episode files concurrently
             if ($isDirectSeriesType && $hasAmp) {
-                $postFuture = \Amp\async(static fn(): array => fd_fetch_stream_ajax('get_post', ['post_id' => $postId]));
-                $filesFuture = \Amp\async(static fn(): array => fd_fetch_series_episode_files($postId));
+                $postFuture = $cachedPostData ? \Amp\async(static fn(): array => $cachedPostData) : \Amp\async(static fn(): array => fd_fetch_stream_ajax('get_post', ['post_id' => $postId]));
+                $filesFuture = \Amp\async(static fn(): array => fd_fetch_series_episode_files($postId, $cachedPostData));
                 [$postData, $files] = \Amp\Future\await([$postFuture, $filesFuture]);
                 $post = !empty($postData) && is_array($postData) ? ($postData[0] ?? $postData) : [];
             } else {
-                $postData = fd_fetch_stream_ajax('get_post', ['post_id' => $postId]);
+                $postData = $cachedPostData ?: fd_fetch_stream_ajax('get_post', ['post_id' => $postId]);
                 $post = !empty($postData) && is_array($postData) ? ($postData[0] ?? $postData) : [];
+            }
+            if (!empty($post) && !is_file($postDataCacheFile)) {
+                @file_put_contents($postDataCacheFile, json_encode($post, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
             }
 
             $title = $post['title'] ?? 'PencariMovie Media';
@@ -12972,6 +13364,29 @@ if ($isNuvioRoute) {
                                 @file_put_contents($cFile, json_encode(['name' => (string)$res['resolved_title'], 'year' => (string)($res['resolved_year'] ?? ''), 'aka' => ''], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
                             }
                             if (!empty($res['items']) && is_array($res['items'])) {
+                                foreach ($res['items'] as $f) {
+                                    $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
+                                    $fCaption = (string) ($f['caption'] ?? '');
+                                    if (fd_movie_file_matches_title($fTitle, $primaryMovieTitle, $searchedYear, $searchedAka, $fCaption)) {
+                                        $filesToStream[] = $f;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // If primary title returned 0 files and contains an apostrophe, probe the no-apostrophe variant via fast path
+                    if (empty($filesToStream) && preg_match("/['’`]/u", $cleanMovieTitle)) {
+                        $noAposMovieTitle = trim(preg_replace("/['’`]/u", '', $cleanMovieTitle));
+                        if ($noAposMovieTitle !== '') {
+                            $apiBase = FD_WP_API_BASE;
+                            $mUrl = "{$apiBase}/stream-files?type=movie&limit=150"
+                                . "&title=" . urlencode($noAposMovieTitle)
+                                . ($searchedYear !== '' ? "&year=" . urlencode($searchedYear) : '')
+                                . ($itemId !== '' ? "&id=" . urlencode($itemId) : '');
+                            $res = fd_http_json($mUrl, [], 'GET', 15);
+                            if (isset($res['ok']) && !empty($res['items']) && is_array($res['items'])) {
+                                $movieFastPathDone = true;
                                 foreach ($res['items'] as $f) {
                                     $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
                                     $fCaption = (string) ($f['caption'] ?? '');
@@ -15253,6 +15668,25 @@ if (str_starts_with($path, '/api/')) {
             $cBotId = !empty($res['bot_id']) ? (string) $res['bot_id'] : $botId;
             $resolved = $res;
 
+            // A definitive "File ID not found for this request" is WordPress refusing the code, and
+            // nothing below can change that answer: the guest-bot provisioning loop and the three
+            // session-boot fallbacks each pay for a boot that cannot help. Measured on dead
+            // short_codes (tuPpIB / agk9oH): the resolve gave up in ~2 s, the answer reached the
+            // client 9-16 s later, all of it boot attempts. Answer with what we already know.
+            if ($candidateFileId === '' && stripos((string) ($res['message'] ?? ''), 'not found for this request') !== false) {
+                fd_log('download refused - WordPress does not have this short_code', [
+                    'short_code' => $shortCode,
+                    'message' => (string) $res['message'],
+                ]);
+                fd_json([
+                    'ok' => 0,
+                    'message' => (string) $res['message'],
+                    'short_code' => $shortCode,
+                    'bot_id' => $botId,
+                    'retried_bots' => count($candidateBots),
+                ], 404);
+            }
+
             if ($candidateFileId !== '') {
                 // Try booting MadelineProto for this winning bot
                 [$bootedMadeline, $bootErr] = fd_boot_madeline(null, [], $cBotId);
@@ -15448,6 +15882,12 @@ if (str_starts_with($path, '/api/')) {
         // a fresh guest bot while watching). On an IPC-death error we re-boot with
         // whichever bot/IPC worker is currently active and retry the same file.
         $maxDownloadAttempts = ($shortCode !== '') ? 4 : 1;
+        // A dead file reference is recovered by re-resolving, and that is worth doing ONCE per
+        // request - the native server's `refreshed` flag (NativeHttpServer.primeFirstChunk).
+        // Measured there: all 14 refreshes of a concurrent burst returned the same file id the
+        // request already held, so attempts 2-4 re-read with that id instead of paying resolve-file
+        // again (each of those costs its own 6 s HTTP timeout plus up to 4.2 s of retry polling).
+        $refRefreshed = false;
 
         // The abort callback is a Closure. Over IPC, MadelineProto wraps it in
         // danog\MadelineProto\Ipc\Wrapper, which cannot serialize a Closure —
@@ -15520,14 +15960,18 @@ if (str_starts_with($path, '/api/')) {
                 ]);
 
                 // If FILE_REFERENCE_EXPIRED or could not refresh file reference and we have a short_code,
-                // re-resolve the shortcode with cache bypassed to get a fresh file_id and retry
+                // re-resolve the shortcode with cache bypassed to get a fresh file_id and retry.
+                // At most once per request - see $refRefreshed above.
                 $isRefExpired = (stripos($errStr, 'FILE_REFERENCE_EXPIRED') !== false || stripos($errStr, 'refresh file reference') !== false);
-                if ($isRefExpired && $shortCode !== '') {
-                    fd_log('file reference expired, re-resolving short_code with nocache', ['short_code' => $shortCode]);
-                    // Re-resolve bypassing local cache
-                    $reResolved = fd_resolve_shortcode($shortCode, $botId, true);
+                if ($isRefExpired && $shortCode !== '' && $downloadAttempt < $maxDownloadAttempts) {
+                    // Invalidate stale resolve cache in worker memory and on disk before re-resolving
+                    fd_invalidate_resolve_cache($shortCode, $botId);
+                    fd_log('file reference expired, re-resolving short_code with nocache', ['short_code' => $shortCode, 'attempt' => $downloadAttempt]);
+                    // Re-resolve bypassing local cache, memoised for 10 s so the other range requests
+                    // the player already has in flight reuse this one refresh instead of repeating it.
+                    $reResolved = fd_resolve_shortcode_fresh($shortCode, $botId);
                     $newFileId = trim((string) ($reResolved['file_id_mt'] ?? $reResolved['file_id'] ?? ''));
-                    if ($newFileId !== '' && $newFileId !== $fileId && $downloadAttempt < $maxDownloadAttempts) {
+                    if ($newFileId !== '') {
                         $fileId = $newFileId;
                         $fileSize = (int) ($reResolved['file_size'] ?? $fileSize);
                         if (!empty($reResolved['bot_id']) && (string) $reResolved['bot_id'] !== $botId) {
@@ -15539,29 +15983,29 @@ if (str_starts_with($path, '/api/')) {
                                 $abortCallback = $isIpcClient ? null : $abortCallback;
                             }
                         }
+                        // Even if same fileId was returned, the Telegram reference was refreshed upstream.
+                        // Retry download with this bot (matching NativeHttpServer.primeFirstChunk).
                         continue;
                     }
 
-                    // If same bot returned identical or empty file_id, try candidate bots in pool
-                    if (($newFileId === '' || $newFileId === $fileId) && $downloadAttempt < $maxDownloadAttempts) {
-                        $pool = fd_get_bot_pool();
-                        foreach ($pool as $pBot) {
-                            $altBotId = (string) ($pBot['bot_id'] ?? '');
-                            if ($altBotId !== '' && $altBotId !== $botId && fd_has_local_session($altBotId)) {
-                                fd_log('file reference expired, trying alternate bot from pool', ['short_code' => $shortCode, 'alt_bot_id' => $altBotId]);
-                                $altResolved = fd_resolve_shortcode($shortCode, $altBotId, true);
-                                $altFileId = trim((string) ($altResolved['file_id_mt'] ?? $altResolved['file_id'] ?? ''));
-                                if ($altFileId !== '') {
-                                    [$altMadeline] = fd_boot_madeline(null, [], $altBotId);
-                                    if ($altMadeline) {
-                                        $madeline = $altMadeline;
-                                        $botId = $altBotId;
-                                        $fileId = $altFileId;
-                                        $fileSize = (int) ($altResolved['file_size'] ?? $fileSize);
-                                        $isIpcClient = $madeline instanceof \danog\MadelineProto\Ipc\Client;
-                                        $abortCallback = $isIpcClient ? null : $abortCallback;
-                                        continue 2;
-                                    }
+                    // If same bot returned empty file_id, try candidate bots in pool
+                    $pool = fd_get_bot_pool();
+                    foreach ($pool as $pBot) {
+                        $altBotId = (string) ($pBot['bot_id'] ?? '');
+                        if ($altBotId !== '' && $altBotId !== $botId && fd_has_local_session($altBotId)) {
+                            fd_log('file reference expired, trying alternate bot from pool', ['short_code' => $shortCode, 'alt_bot_id' => $altBotId]);
+                            $altResolved = fd_resolve_shortcode($shortCode, $altBotId, true);
+                            $altFileId = trim((string) ($altResolved['file_id_mt'] ?? $altResolved['file_id'] ?? ''));
+                            if ($altFileId !== '') {
+                                [$altMadeline] = fd_boot_madeline(null, [], $altBotId);
+                                if ($altMadeline) {
+                                    $madeline = $altMadeline;
+                                    $botId = $altBotId;
+                                    $fileId = $altFileId;
+                                    $fileSize = (int) ($altResolved['file_size'] ?? $fileSize);
+                                    $isIpcClient = $madeline instanceof \danog\MadelineProto\Ipc\Client;
+                                    $abortCallback = $isIpcClient ? null : $abortCallback;
+                                    continue 2;
                                 }
                             }
                         }
