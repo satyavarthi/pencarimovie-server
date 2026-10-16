@@ -189,6 +189,45 @@ define('FD_MAX_LOG_SIZE', 5 * 1024 * 1024); // 5 MB max per log file
 define('FD_DEFAULT_UPSTREAM_MANIFEST_URL', 'https://aiometadata.elfhosted.com/stremio/136f7ae5-2f15-471d-8f3f-79ee335bbd24/manifest.json');
 define('FD_DEFAULT_UPSTREAM_MANIFEST_NAME', 'AIOMetadata');
 
+// Subtitles-only default upstream (OpenSubtitles v3). Its manifest is
+// `{"id":"org.stremio.opensubtitlesv3","catalogs":[],"resources":["subtitles"],
+//   "types":["movie","series"],"idPrefixes":["tt"]}` — measured behaviour:
+//   * MOVIE  : `/subtitles/movie/tt4154756.json`              -> 39 KB of subs
+//   * SERIES : `/subtitles/series/tt0944947:1:1.json`          -> 94 subs (S1E1)
+//              `/subtitles/series/tt0944947:8:6.json`          -> 98 subs (S8E6)
+//              `/subtitles/series/tt0944947.json` (no S/E)     -> EMPTY
+//   * `videoHash` / `videoSize` / `filename` extras are IGNORED — the response
+//     for tt4154756 with and without them is byte-identical (39150 B), so the
+//     addon matches on the IMDb id in the path ONLY (it lists every subtitle for
+//     the title and lets the client rank by `subtitleFileName` /
+//     `movieReleaseName` / `releaseGroup`), unlike the old OpenSubtitles v1
+//     addon which hash-matched the exact file.
+// Consequence: a PencariMovie `pm:*` id must be translated to `tt…` (series:
+// `tt…:S:E`) before it can be asked — see fd_resolve_subtitle_target_id().
+define('FD_DEFAULT_SUBTITLE_MANIFEST_URL', 'https://opensubtitles-v3.strem.io/manifest.json');
+define('FD_DEFAULT_SUBTITLE_MANIFEST_NAME', 'OpenSubtitles v3');
+// Host used to detect the default subtitle addon in a saved settings file.
+define('FD_DEFAULT_SUBTITLE_HOST', 'opensubtitles-v3.strem.io');
+// One-time seed marker inside storage/catalog_settings.json. Installs that
+// already have an upstream list get the subtitle addon appended exactly once,
+// so a user who deletes it never has it resurrected on the next load.
+define('FD_SUBTITLE_SEED_KEY', 'subtitle_seed_v1');
+
+// Title -> IMDb resolution (OpenSubtitles is keyed on IMDb ids only, and our
+// own catalog posts do not always carry one). Two steps, BOTH on our own stack
+// — no third-party search endpoint is called:
+//   1. WordPress `GET /lookup-id?prefix=imdb&title=…&year=…` — a Manticore
+//      MATCH over media_ids_idx (title + aka). Added to my-rest-api/main.php.
+//   2. When that misses, the *searchable* catalog of a configured upstream
+//      manifest that declares a `meta` resource. AIOMetadata exposes
+//      `movie/search.movie` and `series/search.series` (each with a `search`
+//      extra) and returns `tt…` metadatas, so it resolves titles our catalog
+//      posts were never backfilled for.
+// A hit from either step is written back into media_ids_idx under the catalog
+// post (`POST {WP_API_BASE}/media-ids`), so the next request resolves locally
+// in ~1ms and every other addon benefits from the same row.
+define('FD_SUBTITLE_ID_CACHE_TTL', 604800); // 7d for a resolved title -> tt
+
 function fd_cache_path(string $file): string
 {
     $dir = FD_CACHE_DIR;
@@ -224,6 +263,9 @@ function fd_prune_cache_files(bool $force = false): void
         'sub_cache_'     => 1800,   // 30m
         'cinemeta_'      => 86400,  // 24h
         'upstream_manifest_' => 7200, // 2h
+        'post_identity_' => 604800, // 7d  (media_ids_idx post:<id> row)
+        'file_title_'    => 604800, // 7d  (short_code -> file name, for subtitles)
+        'tt_title_'      => 604800, // 7d  (title -> imdb, for subtitles)
     ];
 
     // 1. Move or purge legacy cache files scattered in storage/ root
@@ -369,6 +411,23 @@ function fd_json(array $data, int $status = 200): never
         fastcgi_finish_request();
     }
     exit;
+}
+
+/**
+ * Write a line to the SAPI's stderr so it shows up in the platform log stream
+ * (Heroku `heroku logs`, Docker, systemd).
+ *
+ * fd_log() writes to storage/debug.log (plus error_log()), and `php -i` on the
+ * deployed image reports an EMPTY error_log ini - so nothing from the app ever
+ * reaches `heroku logs`. Only low-volume, decision-level events belong here (the
+ * IPC pre-warm uses it).
+ */
+function fd_log_stderr(string $message, array $context = []): void
+{
+    $suffix = $context
+        ? ' ' . json_encode($context, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)
+        : '';
+    @file_put_contents('php://stderr', '[PencariMovie] ' . $message . $suffix . PHP_EOL, FILE_APPEND);
 }
 
 function fd_log(string $message, array $context = []): void
@@ -2556,11 +2615,119 @@ function fd_media_ids_delete(array $pairs): void
 }
 
 /**
+ * Fetch + disk-cache an upstream addon manifest (2h TTL).
+ *
+ * Cached whenever the response is a valid addon descriptor — NOT only when it
+ * carries catalogs. Subtitles-only addons (OpenSubtitles v3) declare
+ * `catalogs: []`, and the old inline check `empty($mJson['catalogs'])` treated
+ * every request as a cache miss, so `/manifest.json` paid a blocking HTTP call
+ * on EVERY load once such an addon was configured.
+ */
+function fd_upstream_manifest_json(string $manifestUrl): array
+{
+    $manifestUrl = trim($manifestUrl);
+    if ($manifestUrl === '') {
+        return [];
+    }
+    static $memory = [];
+    if (isset($memory[$manifestUrl])) {
+        return $memory[$manifestUrl];
+    }
+
+    $cacheFile = fd_storage_path('storage/upstream_manifest_' . md5($manifestUrl) . '.json');
+    if (is_file($cacheFile) && (time() - (int) @filemtime($cacheFile)) < 7200) {
+        $raw = @file_get_contents($cacheFile);
+        $decoded = $raw ? json_decode($raw, true) : null;
+        if (is_array($decoded) && !empty($decoded['id'])) {
+            return $memory[$manifestUrl] = $decoded;
+        }
+    }
+
+    $decoded = fd_http_json($manifestUrl, [], 'GET', 6);
+    if (is_array($decoded) && !empty($decoded['id'])) {
+        @file_put_contents(
+            $cacheFile,
+            json_encode($decoded, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
+            LOCK_EX
+        );
+        return $memory[$manifestUrl] = $decoded;
+    }
+
+    return $memory[$manifestUrl] = (is_array($decoded) ? $decoded : []);
+}
+
+/**
+ * Does this manifest declare a given resource?
+ *
+ * Stremio allows both `"resources": ["subtitles"]` and the object form
+ * `"resources": [{"name":"subtitles","types":[…],"idPrefixes":[…]}`, so both
+ * shapes are accepted.
+ */
+function fd_manifest_has_resource(array $manifest, string $resource): bool
+{
+    if (empty($manifest['resources']) || !is_array($manifest['resources'])) {
+        return false;
+    }
+    foreach ($manifest['resources'] as $entry) {
+        $name = is_array($entry) ? (string) ($entry['name'] ?? '') : (string) $entry;
+        if ($name !== '' && strcasecmp($name, $resource) === 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Configured upstream manifests that declare a given resource.
+ *
+ * Keeping the fan-out resource-aware matters because the two default upstreams
+ * are disjoint: AIOMetadata exposes `catalog` + `meta`, OpenSubtitles v3 exposes
+ * only `subtitles`. Without this filter every external-id resolution and every
+ * subtitle lookup fires a doomed request at the wrong addon.
+ *
+ * A manifest that cannot be fetched (offline / 5xx) is KEPT, so a transient
+ * network failure never silently disables bridging.
+ *
+ * @param string $resource            'subtitles' | 'meta' | 'stream' | 'catalog'
+ * @param bool   $respectMasterSwitch when false, ignores `upstream_enabled`
+ *                                    (used for external-ID resolution, which
+ *                                    must keep working for other addons)
+ */
+function fd_upstream_manifests_with_resource(string $resource, bool $respectMasterSwitch = true): array
+{
+    $catSettings = fd_load_catalog_settings();
+    if ($respectMasterSwitch && empty($catSettings['upstream_enabled'])) {
+        return [];
+    }
+    $raw = (array) ($catSettings['upstream_manifests'] ?? []);
+    $valid = array_values(array_filter($raw, function ($m) {
+        return is_array($m) && !empty($m['url']);
+    }));
+
+    $matched = [];
+    foreach ($valid as $m) {
+        $manifest = fd_upstream_manifest_json(trim((string) $m['url']));
+        if (empty($manifest['id'])) {
+            $matched[] = $m;   // unknown — keep legacy behaviour
+            continue;
+        }
+        if (fd_manifest_has_resource($manifest, $resource)) {
+            $matched[] = $m;
+        }
+    }
+    return $matched;
+}
+
+/**
  * Upstream resolver manifests used to resolve external metadata (tt, tmdb, kitsu, mal, etc.)
  * and populate media_ids_idx on demand.
  * This runs EVEN IF `upstream_enabled` is false in catalog configuration, ensuring
  * that playing an external media ID from any other addon will always resolve metadata,
  * index it to media_ids_idx, and return streams.
+ *
+ * Filtered to addons that declare a `meta` resource: this list is queried with
+ * `/meta/{type}/{id}.json` on the hot path of every external-id stream request,
+ * and a subtitles-only upstream can never answer it.
  */
 function fd_get_upstream_resolver_manifests(): array
 {
@@ -2569,6 +2736,14 @@ function fd_get_upstream_resolver_manifests(): array
     $valid = array_values(array_filter($raw, function ($m) {
         return is_array($m) && !empty($m['url']);
     }));
+
+    if (!empty($valid)) {
+        $metaCapable = fd_upstream_manifests_with_resource('meta', false);
+        if (!empty($metaCapable)) {
+            $valid = $metaCapable;
+        }
+    }
+
     if (empty($valid)) {
         $valid = [
             [
@@ -3878,30 +4053,23 @@ function fd_prewarm_streams_batch(array $files, string $botId = '', string $cont
 }
 
 /**
- * Helper to look up an IMDb ID for a media title via Cinemeta
- * so OpenSubtitles can be fetched in the web player even when files don't have an explicit IMDb ID.
- */
-/**
- * Retrieve subtitles for a media item from OpenSubtitles and upstream manifests,
- * with caching, language normalization, and automatic ID resolution.
+ * Retrieve subtitles for a media item from the configured upstream subtitle
+ * addons, with caching, language normalization, and automatic ID translation.
  */
 function fd_get_item_subtitles(string $itemType, string $itemId): array
 {
-    // Internal pm:post: IDs cannot be resolved by external subtitle providers (OpenSubtitles)
-    // Avoid slow Cinemeta fallback queries on internal synthetic IDs
-    if (str_starts_with($itemId, 'pm:post:') || str_starts_with($itemId, 'pm_post_') || str_starts_with($itemId, 'pm:file:') || str_starts_with($itemId, 'pm_file_')) {
+    // Translate the requested id into what an upstream subtitle addon can
+    // actually match. OpenSubtitles v3 keys ONLY on the IMDb id in the path —
+    // `tt1234567` for a movie, `tt1234567:SEASON:EPISODE` for a series — and it
+    // IGNORES the videoHash/videoSize/filename extras (measured: byte-identical
+    // responses), so a PencariMovie `pm:*` catalog id must be resolved to `tt…`
+    // first. See fd_resolve_subtitle_target_id().
+    $target = fd_resolve_subtitle_target_id($itemType, $itemId);
+    if ($target['id'] === '') {
         return [];
     }
-
-    // If not starting with 'tt' (e.g. searching with title text or short code), resolve to IMDb ID
-    if (!preg_match('/^tt\d{6,10}/i', $itemId)) {
-        $resolvedImdb = fd_find_imdb_id_for_title($itemId);
-        if ($resolvedImdb !== '') {
-            $itemId = $resolvedImdb;
-        } else {
-            return [];
-        }
-    }
+    $itemType = $target['type'];
+    $itemId   = $target['id'];
 
     // Check local disk cache (30 min TTL)
     $subCacheFile = fd_storage_path('storage/sub_cache_' . md5($itemType . '_' . $itemId) . '.json');
@@ -3915,22 +4083,12 @@ function fd_get_item_subtitles(string $itemType, string $itemId): array
     $subtitles = [];
     $seenSubIds = [];
 
-    // Build list of subtitle endpoints: OpenSubtitles v3 & OpenSubtitlesv3 PRO
-    $proCfg = base64_encode(json_encode([
-        'langs' => ['en', 'id', 'ms', 'ar', 'es', 'zh', 'ja', 'ko', 'fr', 'de'],
-        'source' => 'all',
-        'aiTranslated' => true,
-        'autoAdjustment' => false,
-    ]));
-
+    // Ask only addons that declare a `subtitles` resource: a meta/stream-only
+    // upstream answers 404 to /subtitles/..., and this route is on the player's
+    // critical path. The helper falls back to the configured list when a manifest
+    // cannot be fetched, so a network hiccup never silences subtitles.
     $subEndpoints = [];
-
-    $catSettings = fd_load_catalog_settings();
-    // Respect the master upstream switch — query configured upstream addons for subtitles
-    $configuredUpstreams = !empty($catSettings['upstream_enabled'])
-        ? (array) ($catSettings['upstream_manifests'] ?? [])
-        : [];
-    foreach ($configuredUpstreams as $upstream) {
+    foreach (fd_upstream_manifests_with_resource('subtitles') as $upstream) {
         $manifestUrl = trim((string)($upstream['url'] ?? ''));
         if ($manifestUrl === '') continue;
         $baseAddonUrl = preg_replace('#/manifest\.json(\?.*)?$#i', '', $manifestUrl);
@@ -3988,51 +4146,585 @@ function fd_get_item_subtitles(string $itemType, string $itemId): array
     return $subtitles;
 }
 
-function fd_find_imdb_id_for_title(string $rawTitle): string
+/**
+ * Translate any id this addon can be asked about into the id an upstream
+ * subtitle addon expects: `tt1234567` for a movie, `tt1234567:S:E` for a series
+ * episode.
+ *
+ * Sources, in order:
+ *   1. `tt…` (optionally `:S:E`)                   → used as-is
+ *   2. `pm:post:<id>[:S:E]` / `pm_post_<id>`       → our catalog post
+ *   3. `pm:file:<short_code>` / `pm_file_<code>`   → the file name
+ *   4. any other external prefix (`tmdb:`, `kitsu:`) → fd_resolve_external_media_metadata()
+ *   5. bare text                                   → title lookup
+ *
+ * @return array{id:string,type:string} id is '' when unresolvable, so callers
+ *                                      return no subtitles instead of asking a
+ *                                      provider that can never match.
+ */
+function fd_resolve_subtitle_target_id(string $itemType, string $rawId): array
 {
-    // If raw title is an internal pm ID, it is not a real search title
-    if (str_starts_with($rawTitle, 'pm:post:') || str_starts_with($rawTitle, 'pm_post_') || str_starts_with($rawTitle, 'pm:file:') || str_starts_with($rawTitle, 'pm_file_')) {
-        return '';
+    $rawId = trim($rawId);
+    $type  = (str_contains(strtolower($itemType), 'series') || str_contains(strtolower($itemType), 'tv')) ? 'series' : 'movie';
+    $empty = ['id' => '', 'type' => $type];
+    if ($rawId === '') {
+        return $empty;
     }
 
-    // Skip Cinemeta search for audio/music files (mp3, m4a, flac, etc.)
+    // 1. IMDb id, optionally with the season/episode Stremio appends for series.
+    if (preg_match('/^(tt\d{6,10})(?::(\d+):(\d+))?$/i', $rawId, $m)) {
+        if (!empty($m[2]) && !empty($m[3])) {
+            return ['id' => $m[1] . ':' . (int) $m[2] . ':' . (int) $m[3], 'type' => 'series'];
+        }
+        return ['id' => $m[1], 'type' => $type];
+    }
+
+    // 2. One of OUR catalog posts. media_ids_idx stores the IMDb id on the
+    //    `post:<id>` row when the catalog was backfilled; when it is missing the
+    //    id is resolved by title and written back (fd_imdb_id_for_catalog_post).
+    if (preg_match('/^(?:pm:post:|pm:post_|pm_post_)(\d+)(?::(\d+):(\d+))?$/i', $rawId, $m)) {
+        $postId  = (int) $m[1];
+        $season  = !empty($m[2]) ? (int) $m[2] : null;
+        $episode = !empty($m[3]) ? (int) $m[3] : null;
+        if ($season !== null && $episode !== null) {
+            $type = 'series';
+        }
+        $imdbId = fd_imdb_id_for_catalog_post($postId, $type);
+        if ($imdbId === '') {
+            return ['id' => '', 'type' => $type];
+        }
+        $id = $imdbId;
+        if ($season !== null && $episode !== null) {
+            $id .= ':' . $season . ':' . $episode;
+        }
+        return ['id' => $id, 'type' => $type];
+    }
+
+    // 3. A direct Telegram file: the file name is the only title we have.
+    if (preg_match('/^(?:pm:file:|pm:file_|pm_file_)(.+)$/i', $rawId, $m)) {
+        $fileTitle = fd_shortcode_display_title(trim($m[1]));
+        if ($fileTitle === '') {
+            return $empty;
+        }
+        $imdbId = fd_find_imdb_id_for_title($fileTitle, $type);
+        return $imdbId === '' ? $empty : ['id' => $imdbId, 'type' => $type];
+    }
+
+    // An unknown internal id is never a real title.
+    if (str_starts_with(strtolower($rawId), 'pm:') || str_starts_with(strtolower($rawId), 'pm_')) {
+        return $empty;
+    }
+
+    // 4. Other external prefixes (tmdb:, kitsu:, mal:, tvdb:, …) — the same
+    //    resolver the stream route uses, which maps them to an IMDb id.
+    if (preg_match('/^[a-z]{2,12}:/i', $rawId)) {
+        $meta   = fd_resolve_external_media_metadata($rawId, $type);
+        $imdbId = (string) ($meta['imdb_id'] ?? '');
+        if ($imdbId === '') {
+            return $empty;
+        }
+        $id = $imdbId;
+        if (!empty($meta['season']) && !empty($meta['episode'])) {
+            $type = 'series';
+            $id .= ':' . (int) $meta['season'] . ':' . (int) $meta['episode'];
+        }
+        return ['id' => $id, 'type' => $type];
+    }
+
+    // 5. Bare text (legacy callers passed a title or a short_code here).
+    $imdbId = fd_find_imdb_id_for_title($rawId, $type);
+    return $imdbId === '' ? $empty : ['id' => $imdbId, 'type' => $type];
+}
+
+/**
+ * Display title for a short_code, used when a `pm:file:*` id must be resolved
+ * to an IMDb id. search_files is tried first (disk-cached, no MadelineProto
+ * boot); fd_resolve_shortcode is the fallback.
+ */
+function fd_shortcode_display_title(string $shortCode): string
+{
+    $shortCode = trim($shortCode);
+    if ($shortCode === '') {
+        return '';
+    }
+    $cacheFile = fd_cache_path('file_title_' . md5($shortCode) . '.json');
+    if (is_file($cacheFile) && (time() - (int) @filemtime($cacheFile)) < FD_SUBTITLE_ID_CACHE_TTL) {
+        $cached = json_decode((string) @file_get_contents($cacheFile), true);
+        if (is_array($cached)) {
+            return (string) ($cached['title'] ?? '');
+        }
+    }
+
+    $title = '';
+    $sf = fd_fetch_stream_ajax('search_files', ['search' => $shortCode, 'limit' => 5]);
+    if (is_array($sf) && !empty($sf['files']) && is_array($sf['files'])) {
+        foreach ($sf['files'] as $f) {
+            if (($f['short_code'] ?? '') === $shortCode) {
+                $title = (string) ($f['title'] ?? '');
+                break;
+            }
+        }
+    }
+    if ($title === '') {
+        $res = fd_resolve_shortcode($shortCode, fd_get_bot_id());
+        $title = (string) ($res['title'] ?? '');
+    }
+
+    if ($title !== '') {
+        @file_put_contents(
+            $cacheFile,
+            json_encode(['title' => $title], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
+            LOCK_EX
+        );
+    }
+    return $title;
+}
+
+/**
+ * The media_ids_idx `post:<id>` identity row for one of our catalog posts.
+ * Cached 7d on a hit, 15m on a miss (a miss may be a post the catalog has not
+ * indexed yet, so it must not stick for a week).
+ */
+function fd_lookup_catalog_post_identity(int $postId): array
+{
+    $empty = ['title' => '', 'year' => '', 'imdb_id' => '', 'media_type' => '', 'aka' => ''];
+    if ($postId <= 0) {
+        return $empty;
+    }
+    $cacheFile = fd_cache_path('post_identity_' . $postId . '.json');
+    if (is_file($cacheFile)) {
+        $mtime = (int) @filemtime($cacheFile);
+        $cached = json_decode((string) @file_get_contents($cacheFile), true);
+        if (is_array($cached)) {
+            $ttl = !empty($cached['imdb_id']) ? FD_SUBTITLE_ID_CACHE_TTL : 900;
+            if ((time() - $mtime) < $ttl) {
+                return $cached + $empty;
+            }
+        }
+    }
+
+    $res = fd_http_json(
+        FD_WP_API_BASE . '/lookup-id?' . http_build_query(['prefix' => 'post', 'id' => $postId]),
+        [],
+        'GET',
+        4
+    );
+    $out = [
+        'title'      => (string) ($res['title'] ?? ''),
+        'year'       => (string) ($res['year'] ?? ''),
+        'imdb_id'    => (string) ($res['imdb_id'] ?? ''),
+        'media_type' => (string) ($res['media_type'] ?? ''),
+        'aka'        => (string) ($res['aka'] ?? ''),
+    ];
+    if ($out['title'] !== '' || $out['imdb_id'] !== '') {
+        @file_put_contents(
+            $cacheFile,
+            json_encode($out, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
+            LOCK_EX
+        );
+    }
+    return $out;
+}
+
+/**
+ * Resolve a title (+ year) to an IMDb id through media_ids_idx.
+ *
+ * Uses the extended REST route `GET /lookup-id?prefix=imdb&title=…&year=…`
+ * (my-rest-api/main.php), which MATCHes the `title` text field of
+ * media_ids_idx. This is what lets a catalog post whose `imdb_id` is empty
+ * (e.g. post 18056 "Avengers: Infinity War 2018 • Movie") still find
+ * `tt4154756` from the imdb row that already exists for the same title.
+ *
+ * @return array{imdb_id:string,title:string,year:string,media_type:string}
+ */
+function fd_lookup_imdb_id_by_title(string $title, string $year = ''): array
+{
+    $empty = ['imdb_id' => '', 'title' => '', 'year' => '', 'media_type' => ''];
+    $title = trim($title);
+    if ($title === '') {
+        return $empty;
+    }
+    $cacheFile = fd_cache_path('tt_title_' . md5(strtolower($title) . '|' . $year) . '.json');
+    if (is_file($cacheFile)) {
+        $mtime = (int) @filemtime($cacheFile);
+        $cached = json_decode((string) @file_get_contents($cacheFile), true);
+        if (is_array($cached)) {
+            $ttl = !empty($cached['imdb_id']) ? FD_SUBTITLE_ID_CACHE_TTL : 900;
+            if ((time() - $mtime) < $ttl) {
+                return $cached + $empty;
+            }
+        }
+    }
+
+    $res = fd_http_json(
+        FD_WP_API_BASE . '/lookup-id?' . http_build_query([
+            'prefix' => 'imdb',
+            'title'  => $title,
+            'year'   => $year,
+        ]),
+        [],
+        'GET',
+        4
+    );
+    $out = [
+        'imdb_id'    => (string) ($res['imdb_id'] ?? ''),
+        'title'      => (string) ($res['title'] ?? ''),
+        'year'       => (string) ($res['year'] ?? ''),
+        'media_type' => (string) ($res['media_type'] ?? ''),
+    ];
+    @file_put_contents(
+        $cacheFile,
+        json_encode($out, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
+        LOCK_EX
+    );
+    return $out;
+}
+
+/**
+ * Search a configured upstream addon for a title and return the IMDb id it
+ * reports.
+ *
+ * Uses the manifest of every upstream that declares a `meta` resource and,
+ * inside it, a catalog of the requested type carrying a `search` extra —
+ * AIOMetadata ships `movie/search.movie` and `series/search.series` and answers
+ * with `tt…` metadatas. This covers catalog posts that were never backfilled
+ * with an external id (whose title MATCH therefore missed); the hit is written
+ * back into media_ids_idx by the caller.
+ *
+ * @return array{imdb_id:string,title:string,year:string}
+ */
+function fd_search_upstream_for_imdb(string $title, string $year = '', string $type = 'movie'): array
+{
+    $empty = ['imdb_id' => '', 'title' => '', 'year' => ''];
+    $title = trim($title);
+    if ($title === '') {
+        return $empty;
+    }
+    $type = (str_contains(strtolower($type), 'series') || str_contains(strtolower($type), 'tv')) ? 'series' : 'movie';
+
+    // The query must be the BARE title. Catalog titles carry a "• Movie" suffix
+    // and the year, and AIOMetadata's search is literal — MEASURED against the
+    // default upstream:
+    //   "Avengers: Infinity War"              -> 2 metas
+    //   "Avengers: Infinity War 2018"         -> {"metas":[]}
+    //   "Avengers: Infinity War 2018 Movie"   -> {"metas":[]}
+    // The year is therefore used only to PREFER a candidate below.
+    $searchTitle = fd_strip_title_decorations($title);
+    if ($searchTitle === '') {
+        $searchTitle = $title;
+    }
+    $query          = $searchTitle;
+    $wantedNorm     = fd_norm_title_for_match($searchTitle);
+    $wantedYear     = preg_match('/\b(19\d\d|20\d\d)\b/', $year) ? (int) $year : 0;
+    $firstTitleMatch = null;
+
+    foreach (fd_get_upstream_resolver_manifests() as $upstream) {
+        $manifestUrl = trim((string) ($upstream['url'] ?? ''));
+        if ($manifestUrl === '') {
+            continue;
+        }
+        $manifest = fd_upstream_manifest_json($manifestUrl);
+        if (empty($manifest['catalogs']) || !is_array($manifest['catalogs'])) {
+            continue;
+        }
+        $base = preg_replace('#/manifest\.json(\?.*)?$#i', '', $manifestUrl);
+
+        foreach ($manifest['catalogs'] as $cat) {
+            if (!is_array($cat)) {
+                continue;
+            }
+            $catType = (string) ($cat['type'] ?? '');
+            $catId   = (string) ($cat['id'] ?? '');
+            if ($catId === '' || $catType !== $type) {
+                continue;
+            }
+            $hasSearch = false;
+            foreach ((array) ($cat['extra'] ?? []) as $ex) {
+                if (is_array($ex) && (string) ($ex['name'] ?? '') === 'search') {
+                    $hasSearch = true;
+                    break;
+                }
+            }
+            if (!$hasSearch) {
+                continue;
+            }
+
+            $url = rtrim($base, '/') . "/catalog/{$catType}/" . urlencode($catId)
+                . '/search=' . rawurlencode($query) . '.json';
+            $res = fd_http_json($url, [], 'GET', 6);
+            if (empty($res['metas']) || !is_array($res['metas'])) {
+                continue;
+            }
+            foreach ($res['metas'] as $meta) {
+                if (!is_array($meta)) {
+                    continue;
+                }
+                $id = (string) ($meta['id'] ?? '');
+                if (!preg_match('/^tt\d{6,10}$/', $id)) {
+                    continue;
+                }
+                // Reject a wrong match ("Avengers" → Endgame). Both sides are
+                // normalised identically, so an embedded year or a "• Movie"
+                // suffix never breaks the comparison.
+                $candNorm = fd_norm_title_for_match((string) ($meta['name'] ?? ''));
+                if (
+                    $wantedNorm !== '' && $candNorm !== ''
+                    && strpos($candNorm, $wantedNorm) === false
+                    && strpos($wantedNorm, $candNorm) === false
+                ) {
+                    continue;
+                }
+                $relYear = '';
+                if (preg_match('/\b(19\d\d|20\d\d)\b/', (string) ($meta['releaseInfo'] ?? ''), $ym)) {
+                    $relYear = $ym[1];
+                }
+                $candidate = [
+                    'imdb_id' => $id,
+                    'title'   => (string) ($meta['name'] ?? ''),
+                    'year'    => $relYear,
+                ];
+                // Prefer a release-year match (±1). Series hits frequently report
+                // NO year (AIOMetadata returned an empty releaseInfo for
+                // "Kudrat 1968"), so an unknown year is accepted rather than
+                // rejected — otherwise every series would be dropped.
+                if ($wantedYear === 0 || $relYear === '' || abs((int) $relYear - $wantedYear) <= 1) {
+                    return $candidate;
+                }
+                if ($firstTitleMatch === null) {
+                    $firstTitleMatch = $candidate;
+                }
+            }
+        }
+    }
+    return $firstTitleMatch ?? $empty;
+}
+
+/**
+ * Strip the catalog decorations a `post:` title carries: the "•"/"|" separator,
+ * the release year, and a TRAILING type word ("Movie" / "TvSeries").
+ *
+ * Case and punctuation are PRESERVED — upstream search APIs are literal, and
+ * lowercasing a query changes its results. Only a trailing type word is removed,
+ * so a real title like "Movie 43" survives.
+ */
+function fd_strip_title_decorations(string $title): string
+{
+    $t = html_entity_decode($title, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+    $t = (string) preg_replace('/[\x{2022}\x{2027}\x{00B7}|]+/u', ' ', $t);
+    $t = (string) preg_replace('/\b(19\d\d|20\d\d)\b/', ' ', $t);
+    $t = (string) preg_replace('/\b(?:movie|tvseries|tv\s*series|series)\s*$/i', ' ', $t);
+    // Cut the release suffix. A `pm:file:` id is resolved from the FILE NAME, and
+    // both the literal upstream search and the media_ids_idx phrase match need a
+    // clean title: "Avengers.Infinity.War.2018.2160p.10bit.HDR.BluRay.8CH.x265.HEVC.mkv"
+    // must reduce to "Avengers Infinity War".
+    // Deliberately only unambiguous release tokens: `cam`, `subs`, `multi`,
+    // `hindi` are real words in real titles (Cam, Hindi Medium) and are left alone.
+    $t = (string) preg_replace(
+        '/\b(?:2160p|1440p|1080p|720p|576p|480p|360p|4k|uhd|blu-?ray|bluray|bdrip|brrip|remux|web-?dl|webrip|web|hdtv|hdrip|dvdrip|dvd|hdts|xvid|divx|hevc|x265|x264|h\.?26[45]|avc|av1|vp9|aac|ac3|eac3|dts(?:-hd)?|truehd|atmos|ddp?|flac|10bit|8bit|hdr10\+?|hdr|dovi|proper|repack)\b.*$/i',
+        '',
+        $t
+    );
+    return trim((string) preg_replace('/\s+/', ' ', $t));
+}
+
+/**
+ * Normalised form of a title for comparison: decorations stripped, lowercased,
+ * punctuation collapsed to single spaces.
+ */
+function fd_norm_title_for_match(string $title): string
+{
+    $t = strtolower(fd_strip_title_decorations($title));
+    $t = (string) preg_replace('/[^a-z0-9]+/', ' ', $t);
+    return trim((string) preg_replace('/\s+/', ' ', $t));
+}
+
+/**
+ * Write a resolved IMDb id back into media_ids_idx under one of our catalog
+ * posts. WordPress adds the `post:`/`pm:` rows itself, so this permanently
+ * fixes a post whose `imdb_id` was empty — every later request (and every other
+ * addon) then takes the fast path.
+ */
+function fd_persist_imdb_id_for_post(int $postId, string $imdbId, string $title, string $year, string $type): void
+{
+    if ($postId <= 0 || $imdbId === '') {
+        return;
+    }
+    $mediaType = (str_contains(strtolower($type), 'series') || str_contains(strtolower($type), 'tv')) ? 'tvseries' : 'movie';
+
+    // NOTE: fd_media_ids_upsert() must NOT be used here. It schedules the write
+    // with Amp\async() and returns immediately without awaiting the future, and
+    // this route ends right after — the pending request is dropped and the row
+    // is never updated (measured: post 18056 still had an empty imdb_id after a
+    // "resolved and persisted" log line). The write has to be synchronous, and
+    // it needs a 12s timeout: the WordPress side regularly takes >5s, which made
+    // it return a spurious 500 from a slow client.
+    $written = 0;
+    if (defined('FD_WP_API_BASE')) {
+        $res = fd_http_json(
+            FD_WP_API_BASE . '/media-ids',
+            [
+                'post_id'    => $postId,
+                // `post`/`pm` are sent EXPLICITLY as well: the REST handler
+                // synthesises them from post_id, but it used to drop that
+                // parameter entirely, and a caller must not depend on it.
+                'media_ids'  => [
+                    'imdb' => $imdbId,
+                    'tt'   => $imdbId,
+                    'post' => (string) $postId,
+                    'pm'   => (string) $postId,
+                ],
+                'title'      => $title !== '' ? $title : $imdbId,
+                'year'       => (int) $year,
+                'imdb_id'    => $imdbId,
+                'media_type' => $mediaType,
+            ],
+            'POST',
+            12
+        );
+        $written = !empty($res['ok']) ? (int) ($res['written'] ?? 0) : 0;
+    }
+    if ($written === 0) {
+        fd_log('subtitle id persist failed', [
+            'post_id' => $postId,
+            'imdb_id' => $imdbId,
+            'title'   => $title,
+        ]);
+    }
+    // Refresh the identity cache so the next request takes the fast path.
+    @file_put_contents(
+        fd_cache_path('post_identity_' . $postId . '.json'),
+        json_encode([
+            'title'      => $title,
+            'year'       => $year,
+            'imdb_id'    => $imdbId,
+            'media_type' => $mediaType,
+            'aka'        => '',
+        ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
+        LOCK_EX
+    );
+    fd_log('subtitle id resolved and persisted', [
+        'post_id' => $postId,
+        'imdb_id' => $imdbId,
+        'title'   => $title,
+    ]);
+}
+
+/**
+ * IMDb id for one of our catalog posts.
+ *
+ * Fast path: the `post:<id>` row of media_ids_idx already carries the id.
+ * Slow path: resolve it by title and persist it, so the cost is paid once per
+ * post instead of once per playback.
+ */
+function fd_imdb_id_for_catalog_post(int $postId, string $type = 'movie'): string
+{
+    $post = fd_lookup_catalog_post_identity($postId);
+    if (!empty($post['imdb_id'])) {
+        return (string) $post['imdb_id'];
+    }
+    $title = (string) ($post['title'] ?? '');
+    if ($title === '') {
+        return '';
+    }
+    $mediaType = (string) ($post['media_type'] ?? '');
+    $isSeries  = str_contains(strtolower($type), 'series')
+        || str_contains(strtolower($type), 'tv')
+        || stripos($mediaType, 'series') !== false
+        || stripos($mediaType, 'tv') !== false;
+
+    return fd_find_imdb_id_for_title($title, $isSeries ? 'series' : 'movie', $postId);
+}
+
+/**
+ * Title -> IMDb id, used when an id cannot be resolved directly.
+ *
+ * Two lookups, both on our own stack (no third-party search endpoint):
+ *   1. `GET /lookup-id?prefix=imdb&title=…&year=…` — Manticore MATCH on the
+ *      `title` field of media_ids_idx.
+ *   2. The searchable catalog of a configured upstream manifest (AIOMetadata),
+ *      for titles the catalog never indexed.
+ * A hit is cached 7d, and when $catalogPostId is given it is also written back
+ * into media_ids_idx under that post.
+ */
+function fd_find_imdb_id_for_title(string $rawTitle, string $itemType = '', int $catalogPostId = 0): string
+{
+    $rawTitle = trim($rawTitle);
+    if ($rawTitle === '') {
+        return '';
+    }
+    // Audio/music files have no IMDb entry.
     if (preg_match('/\.(?:mp3|m4a|flac|wav|ogg|opus|aac)$/i', $rawTitle)) {
         return '';
     }
+    // An unresolved internal id is not a title.
+    if (preg_match('/^pm[:_]/i', $rawTitle)) {
+        return '';
+    }
 
-    // Clean spam / quality tags / extensions
     $clean = fd_clean_media_title($rawTitle);
     if ($clean === '') {
         $clean = $rawTitle;
     }
-
-    // Extract year if present
     $year = '';
     if (preg_match('/\b(19\d\d|20\d\d)\b/', $clean, $ym)) {
         $year = $ym[1];
-        $clean = trim(preg_replace('/\b(19\d\d|20\d\d)\b.*$/', '', $clean));
     }
-
-    $clean = trim(preg_replace('/[._\-]/', ' ', $clean));
+    $clean = trim((string) preg_replace('/[._\-]+/', ' ', $clean));
     if ($clean === '') {
         return '';
     }
 
-    $cacheKey = 'title_imdb_' . md5(strtolower($clean . '_' . $year));
-    $cacheFile = fd_storage_path('storage/' . $cacheKey . '.txt');
-    if (is_file($cacheFile) && (time() - (int) @filemtime($cacheFile)) < 604800) {
-        return trim((string) @file_get_contents($cacheFile));
+    $type = (str_contains(strtolower($itemType), 'series') || str_contains(strtolower($itemType), 'tv')) ? 'series' : 'movie';
+
+    $cacheFile = fd_storage_path('storage/title_imdb_' . md5(strtolower($clean . '|' . $year . '|' . $type)) . '.txt');
+    if (is_file($cacheFile) && (time() - (int) @filemtime($cacheFile)) < FD_SUBTITLE_ID_CACHE_TTL) {
+        $cached = trim((string) @file_get_contents($cacheFile));
+        if ($cached !== '') {
+            return $cached;
+        }
     }
 
-    $imdbId = '';
-    // Look up via local Manticore media_ids_idx
-    $local = fd_lookup_local_catalog_by_prefix('imdb', $clean);
-    if (!empty($local['imdb_id'])) {
-        $imdbId = (string) $local['imdb_id'];
+    $imdbId         = '';
+    $canonicalTitle = '';
+    $canonicalYear  = $year;
+
+    // 1. media_ids_idx title lookup.
+    $hit = fd_lookup_imdb_id_by_title($clean, $year);
+    if (!empty($hit['imdb_id'])) {
+        $imdbId         = (string) $hit['imdb_id'];
+        $canonicalTitle = (string) ($hit['title'] ?? '');
+        if (!empty($hit['year'])) {
+            $canonicalYear = (string) $hit['year'];
+        }
     }
 
-    if ($imdbId !== '') {
-        @file_put_contents($cacheFile, $imdbId, LOCK_EX);
+    // 2. Searchable catalog of a configured upstream manifest.
+    if ($imdbId === '') {
+        $upHit = fd_search_upstream_for_imdb($clean, $year, $type);
+        if (!empty($upHit['imdb_id'])) {
+            $imdbId         = (string) $upHit['imdb_id'];
+            $canonicalTitle = (string) ($upHit['title'] ?? '');
+            if (!empty($upHit['year'])) {
+                $canonicalYear = (string) $upHit['year'];
+            }
+        }
+    }
+
+    if ($imdbId === '') {
+        fd_log('subtitle id unresolved', ['title' => $clean, 'year' => $year, 'type' => $type]);
+        return '';
+    }
+
+    @file_put_contents($cacheFile, $imdbId, LOCK_EX);
+
+    if ($catalogPostId > 0) {
+        fd_persist_imdb_id_for_post(
+            $catalogPostId,
+            $imdbId,
+            $canonicalTitle !== '' ? $canonicalTitle : $clean,
+            $canonicalYear,
+            $type
+        );
     }
     return $imdbId;
 }
@@ -4402,9 +5094,13 @@ function fd_ipc_worker_ready(string $sessionDir): bool
  * Diffie-Hellman handshake, so during the boot window it is unheld.
  *
  * @param string $sessionDir Absolute session directory (e.g. .../session.madeline)
+ * @param bool $waitForReady When false, spawn the worker detached and return
+ *        immediately instead of waiting up to ~30s for it to publish its
+ *        endpoint. Used by fd_prewarm_ipc_worker() so a web request can start
+ *        the worker without holding a PHP thread for the boot.
  * @return bool True if a worker is running (or was just started).
  */
-function fd_ensure_ipc_worker(string $sessionDir): bool
+function fd_ensure_ipc_worker(string $sessionDir, bool $waitForReady = true): bool
 {
     if (fd_ipc_worker_ready($sessionDir)) {
         return true;
@@ -4422,6 +5118,11 @@ function fd_ensure_ipc_worker(string $sessionDir): bool
             if (fd_ipc_worker_ready($sessionDir)) {
                 @fclose($spawnFp);
                 return true;
+            }
+            if (!$waitForReady) {
+                // A spawn is already in flight; the pre-warm is a no-op.
+                @fclose($spawnFp);
+                return false;
             }
             if ((microtime(true) - $spawnWaitStart) > 30) {
                 // Holder died without publishing; take over the spawn ourselves.
@@ -4492,6 +5193,16 @@ function fd_ensure_ipc_worker(string $sessionDir): bool
         @shell_exec('nohup ' . $cmd . ' > /dev/null 2>&1 &');
     }
 
+    if (!$waitForReady) {
+        // Fire-and-forget pre-warm. The worker publishes its own endpoint when
+        // it is ready, so the caller must not hold a web request open for it.
+        if ($spawnFp) {
+            @flock($spawnFp, LOCK_UN);
+            @fclose($spawnFp);
+        }
+        return true;
+    }
+
     // Wait up to ~30s for the worker to become READY (ipc connectable AND
     // ipcState.php written). Waiting only for `ipc` lets a peer connect to a
     // half-booted worker, which makes MadelineProto's tryConnect() burn its
@@ -4515,6 +5226,57 @@ function fd_ensure_ipc_worker(string $sessionDir): bool
         @fclose($spawnFp);
     }
     return $running;
+}
+
+/**
+ * Start the shared IPC worker in the background, without blocking the request.
+ *
+ * Why: the FIRST playback of a container lifetime used to pay the whole
+ * MadelineProto boot while holding a worker thread - measured on Heroku as
+ * `madeline construction {"ms":14657}` - and with a small thread pool that one
+ * stall is a large slice of the request-timeout budget. Once the worker is warm,
+ * fd_boot_madeline() connects to the published endpoint as an IPC client in
+ * tens of milliseconds instead.
+ *
+ * Call it from the cheap requests a client makes BEFORE it plays anything
+ * (/manifest.json, /stream/*, /api/session); the stream LIST is served from its
+ * own cache, so the worker boots while the user is still looking at the list.
+ *
+ * Safety:
+ *   - only runs when a session exists on disk (never during login/provisioning),
+ *   - a no-op when the worker is already ready,
+ *   - throttled to one spawn attempt per 60s per session, so a request burst or
+ *     a worker that keeps dying cannot turn into a spawn storm,
+ *   - the spawn itself is detached (nohup / `start "" /b`) and therefore
+ *     outlives this request, exactly like fd_ensure_ipc_worker().
+ */
+function fd_prewarm_ipc_worker(): bool
+{
+    // The ACTIVE bot's session, not fd_get_bot_session_path() with no argument:
+    // that returns the legacy single-session FD_SESSION_PATH, which does not
+    // exist in a multi-bot install, so the pre-warm silently never fired.
+    $botId = fd_get_bot_id();
+    if ($botId === '') {
+        return false;
+    }
+    $sessionPath = fd_get_bot_session_path($botId);
+    if (!is_dir($sessionPath) && !is_file($sessionPath)) {
+        return false;
+    }
+    if (fd_ipc_worker_ready($sessionPath)) {
+        return false;
+    }
+    $stamp = fd_cache_path('ipc_prewarm_' . md5($sessionPath) . '.stamp');
+    if (is_file($stamp) && (time() - (int) @filemtime($stamp)) < 60) {
+        return false;
+    }
+    @file_put_contents($stamp, (string) time(), LOCK_EX);
+    $spawned = fd_ensure_ipc_worker($sessionPath, false);
+    if ($spawned) {
+        fd_log('ipc worker pre-warmed in the background', ['session' => basename($sessionPath)]);
+        fd_log_stderr('ipc worker pre-warmed in the background', ['session' => basename($sessionPath)]);
+    }
+    return $spawned;
 }
 
 /**
@@ -5869,7 +6631,16 @@ function fd_extract_split_part_info(string $filename, string $caption = ''): arr
         $matched = true;
         // Strip the part marker from base name
         $cleanBase = preg_replace('/[._\s-]part[._\s-]*0*\d{1,4}(?:[._\s\/-]+(?:of[._\s-]+)?0*\d{1,4})?/i', '', $f);
-    } elseif (preg_match('/[._\s-]0*(\d{1,3})\.(mp4|mkv|avi|webm)$/i', $f, $m) && !preg_match('/\b(2160p|1080p|720p|480p|360p)\b/i', $m[0])) {
+    } elseif (
+        preg_match('/[._\s-]0*(\d{1,3})\.(mp4|mkv|avi|webm)$/i', $f, $m)
+        && !preg_match('/\b(2160p|1080p|720p|480p|360p)\b/i', $m[0])
+        // CRITICAL: never read a codec suffix as a part index. "…AAC2.0.H.264.mkv" matches the
+        // pattern above ("." + "264" + ".mkv"), so EVERY H.264/H.265 release was flagged as
+        // "part 264"/"part 265". With exclude_part_title ON by default
+        // (fd_load_catalog_settings() → 'exclude_part_title' => true) that silently removed the
+        // most common encodes from every stream list. A real split of 263+ parts does not exist.
+        && !in_array((int) $m[1], [263, 264, 265], true)
+    ) {
         // e.g. Something.001.mp4 or Something-001.mkv
         $partNum = (int) $m[1];
         $matched = true;
@@ -6511,9 +7282,22 @@ function fd_series_file_matches_title(string $fileTitle, string $seriesTitle, in
     // 2. Normalize series title
     $cleanSeries = preg_replace('/\s*[•··]\s*.+$/u', '', fd_clean_html_entities($seriesTitle));
     $cleanSeries = preg_replace('/\b(?:tvseries|series|season|musim|drama|episode|bahagian)\b.*/i', '', $cleanSeries);
-    if ($seriesYear !== '') {
-        $cleanSeries = preg_replace('/\b' . preg_quote($seriesYear, '/') . '\b/', ' ', $cleanSeries);
-    }
+
+    // Strip only the TRAILING release year ("Glory 2025" -> "Glory").
+    //
+    // CRITICAL: do NOT go back to stripping the first occurrence of $seriesYear anywhere in the
+    // title. Some shows carry the franchise year in their NAME, e.g.
+    // "Kudrat 1968: High Council 2026" (post 9000016669). Removing that embedded "1968" left
+    // "kudrat high council 2026" — a phrase that appears in NO real file name — so all 9 of that
+    // series' S01E01 releases failed the title check and every episode answered "No Streams Found".
+    // Anchoring the strip to the end keeps "kudrat 1968 high council", which the multi-word phrase
+    // check below (step 7) matches against every naming convention these uploaders use:
+    //   Kudrat.1968.High.Council.2026.EP1.MalaySub.mp4
+    //   Kudrat.1968.High.Council.S01E01.1968.1080p.NF.WEB.DL.AAC2.0.H.264.mkv
+    //   FNP22.Kudrat.1968.High.Council.2026.EP01.Subs.Malay.mp4
+    // Regression test: test_kudrat_series.php
+    $cleanSeries = preg_replace('/\s*\b(?:19\d\d|20\d\d)\b\s*$/u', ' ', $cleanSeries);
+
     $cleanSeries = trim(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $cleanSeries));
     $cleanSeries = trim(preg_replace('/\s+/', ' ', $cleanSeries));
     $targetLower = strtolower($cleanSeries);
@@ -6531,7 +7315,19 @@ function fd_series_file_matches_title(string $fileTitle, string $seriesTitle, in
     if ($seriesYear !== '' && $hasFileYear) {
         $fileYear = (int) $fym[1];
         $targetYear = (int) $seriesYear;
-        if ($isSingleWord ? ($fileYear !== $targetYear) : (abs($fileYear - $targetYear) > 1)) {
+        // $fym[1] is the FIRST 4-digit number in the FILE name. When the show name itself embeds
+        // a year ("Kudrat.1968.High.Council.2026.EP1.mp4") that first number is the NAME year
+        // (1968), not a release year — and the series title holds BOTH years, so whichever one
+        // $seriesYear happens to be, a plain compare rejects the whole series. Accept a file year
+        // that genuinely appears anywhere in the series title, so an embedded name year is never
+        // mistaken for a year mismatch. Unrelated years are still rejected: "Glory 2025" keeps
+        // refusing The Glory's 2022 files because 2022 is not a year of "Glory 2025".
+        $seriesTitleYears = [];
+        if (preg_match_all('/\b(19\d\d|20\d\d)\b/', $seriesTitle, $ymAll)) {
+            $seriesTitleYears = array_map('intval', $ymAll[1]);
+        }
+        $yearOk = $isSingleWord ? ($fileYear === $targetYear) : (abs($fileYear - $targetYear) <= 1);
+        if (!$yearOk && !in_array($fileYear, $seriesTitleYears, true)) {
             return false;
         }
     }
@@ -6573,9 +7369,19 @@ function fd_series_file_matches_title(string $fileTitle, string $seriesTitle, in
         return false;
     }
 
-    // For single-word titles with known year (e.g. "Glory 2025"), reject un-yeared files that have foreign platform/region indicators
-    if (!$hasFileYear && $seriesYear !== '' && $isSingleWord) {
-        if (preg_match('/\b(netflix|\bnf\b|k\.o|korean|korea|rarbg|kdg|hindi)\b/i', $fileTitle . ' ' . $fileCaption)) {
+    // For single-word titles with a known year and NO leading "The" (e.g. "Glory 2025"), reject
+    // un-yeared files carrying foreign platform/region indicators — they belong to a DIFFERENT,
+    // same-named show. Two scope limits matter here, both learned the hard way:
+    //   1. A leading "The" is already the discriminator for this family (strict leading-"The"
+    //      check above), so the guard must NOT run for it. Running it dropped every year-less
+    //      release of "The Glory" (2022) — e.g. "The.Glory.S01E16.Hindi.English.Korean.480p
+    //      .WEB.DL.ESubs.BollyFlix.mkv" — because the show itself is Korean/NF.
+    //   2. "hindi" is deliberately NOT an indicator: Hindi (+Korean) dual-audio is the normal
+    //      naming for these shows, so it only produced false negatives.
+    // The "Glory 2025" protection still holds via the leading-"The" check and this guard.
+    // Regression test: test_kudrat_series.php (the "MUST NOT REGRESS" cases).
+    if (!$hasFileYear && $seriesYear !== '' && $isSingleWord && !$hasLeadingThe) {
+        if (preg_match('/\b(netflix|\bnf\b|k\.o|korean|korea|rarbg|kdg)\b/i', $fileTitle . ' ' . $fileCaption)) {
             return false;
         }
     }
@@ -6643,7 +7449,44 @@ function fd_series_file_matches_title(string $fileTitle, string $seriesTitle, in
     return false;
 }
 
-function fd_fetch_stream_ajax(string $action, array $params = []): array
+/**
+ * Fresh window (seconds) for a cached WordPress payload, per action.
+ * Anything older counts as *stale*: it is only ever used as a fallback, never
+ * as a reason to hold a worker thread.
+ */
+function fd_stream_ajax_ttl(string $action): int
+{
+    return match ($action) {
+        'search', 'search_files' => 300,
+        'posts', 'post_files', 'get_post', 'search_music' => 600,
+        'categories', 'trending' => 3600,
+        default => 300,
+    };
+}
+
+/**
+ * Remote WordPress fetch with a disk cache, single-flight and
+ * stale-while-revalidate.
+ *
+ * This is called 1-2x per catalog request and a cold client boot fans out ~33
+ * catalog requests, so an origin call that occupies a worker for its whole
+ * timeout starves the small FrankenPHP thread pool. Measured on a 4-6 thread
+ * pool with max_wait_time 15s: cold-origin searches hit p50 11s / p95 17s and
+ * returned HTTP 503, because every cold cache miss did its own 12s remote call
+ * (retried once when Amp cancelled it). Rules now:
+ *
+ *   1. fresh cache        -> serve it, no origin call at all;
+ *   2. stale + lock taken -> serve the stale copy immediately (no waiting);
+ *   3. stale + we hold it -> refresh with a SHORT timeout, keep stale on error;
+ *   4. nothing cached     -> wait briefly for the in-flight refresher, then
+ *                            return [] so the caller renders an empty catalog
+ *                            instead of pinning the thread for 12s+.
+ *
+ * Identical concurrent requests also collapse into one origin call, which is
+ * what removes the duplicate fan-out between the `top` catalogs and the
+ * dedicated `pm_search_*` catalogs (they issue byte-identical requests).
+ */
+function fd_fetch_stream_ajax(string $action, array $params = [], ?int $timeout = null): array
 {
     $route = str_replace('_', '-', $action);
     $apiBase = defined('FD_WP_API_BASE') ? FD_WP_API_BASE : 'https://pencarimovie.com/wp-json/pencarimovie-server/v1';
@@ -6666,29 +7509,78 @@ function fd_fetch_stream_ajax(string $action, array $params = []): array
     }
     $fullWpUrl = $wpUrl . '?' . http_build_query($queryParams);
 
-    // Direct fetch
+    $timeout = $timeout ?? (in_array($action, ['search', 'search_files'], true) ? 6 : 8);
+    $ttl = fd_stream_ajax_ttl($action);
+    $staleMax = 21600; // serve a stale copy for up to 6h rather than block
+
+    $cacheFile = fd_cache_path('wp_ajax_' . md5($action . '|' . $fullWpUrl) . '.json');
+    $readCache = static function (int $maxAge) use ($cacheFile): ?array {
+        if (!is_file($cacheFile)) {
+            return null;
+        }
+        if ((time() - (int) @filemtime($cacheFile)) > $maxAge) {
+            return null;
+        }
+        $decoded = json_decode((string) @file_get_contents($cacheFile), true);
+        return is_array($decoded) ? $decoded : null;
+    };
+
+    $fresh = $readCache($ttl);
+    if ($fresh !== null) {
+        return $fresh;
+    }
+    $stale = $readCache($staleMax);
+
+    // Single-flight: exactly one worker refreshes a given URL.
+    $lockFp = @fopen($cacheFile . '.lock', 'c');
+    $isRefresher = $lockFp ? @flock($lockFp, LOCK_EX | LOCK_NB) : false;
+
+    if (!$isRefresher) {
+        if ($stale !== null) {
+            return $stale;
+        }
+        // Nothing cached: give the in-flight refresher a brief chance.
+        $deadline = microtime(true) + min(3.0, (float) $timeout);
+        while (microtime(true) < $deadline) {
+            usleep(100000);
+            $fresh = $readCache($ttl);
+            if ($fresh !== null) {
+                return $fresh;
+            }
+        }
+        return [];
+    }
+
     try {
         $body = fd_http_get_contents($fullWpUrl, [
             'method' => 'GET',
             'headers' => ['Accept: application/json'],
-            'timeout' => 12,
+            'timeout' => $timeout,
         ]);
         if (is_string($body) && $body !== '') {
             $decoded = json_decode($body, true);
-            if (is_array($decoded) && isset($decoded['success']) && $decoded['success']) {
-                return (array) ($decoded['data'] ?? []);
-            }
-            if (is_array($decoded) && isset($decoded['ok']) && $decoded['ok']) {
-                return (array) ($decoded['data'] ?? $decoded['items'] ?? $decoded);
-            }
             if (is_array($decoded)) {
-                return (array) ($decoded['data'] ?? $decoded['items'] ?? $decoded);
+                $data = (isset($decoded['success']) && $decoded['success'])
+                    ? (array) ($decoded['data'] ?? [])
+                    : (array) ($decoded['data'] ?? $decoded['items'] ?? $decoded);
+                @file_put_contents(
+                    $cacheFile,
+                    json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
+                    LOCK_EX
+                );
+                return $data;
             }
         }
-        return [];
+        fd_log('stremio wp rest fetch empty', ['action' => $action, 'had_stale' => $stale !== null]);
+        return $stale ?? [];
     } catch (\Throwable $e) {
-        fd_log('stremio wp rest fetch failed', ['action' => $action, 'error' => $e->getMessage()]);
-        return [];
+        fd_log('stremio wp rest fetch failed', ['action' => $action, 'error' => $e->getMessage(), 'had_stale' => $stale !== null]);
+        return $stale ?? [];
+    } finally {
+        if ($lockFp) {
+            @flock($lockFp, LOCK_UN);
+            @fclose($lockFp);
+        }
     }
 }
 
@@ -8358,7 +9250,7 @@ function fd_get_default_catalog_options(): array
         'pm_movies_philippines' => ['type' => 'movie', 'group' => 'country', 'name' => 'Philippines (Movie)', 'default' => false],
         'pm_movies_english' => ['type' => 'movie', 'group' => 'country', 'name' => 'English (Movie)', 'default' => true],
         // Series country catalogs: Series > Country > Year with Genre
-        'pm_series_kdrama' => ['type' => 'series', 'group' => 'country', 'name' => 'K-Drama (Series)', 'default' => false],
+        'pm_series_kdrama' => ['type' => 'series', 'group' => 'country', 'name' => 'K-Drama (Series)', 'default' => true],
         'pm_series_anime' => ['type' => 'series', 'group' => 'country', 'name' => 'Anime (Series)', 'default' => true],
         'pm_series_japan' => ['type' => 'series', 'group' => 'country', 'name' => 'J-Drama (Series)', 'default' => false],
         'pm_series_malay' => ['type' => 'series', 'group' => 'country', 'name' => 'Malaysia (Series)', 'default' => true],
@@ -8413,7 +9305,15 @@ function fd_get_trending_keywords_map(): array
 
     if (!$isRefresher) {
         if ($lockFp) {
+            // A closed resource is still truthy, so clear the variable too:
+            // the finally block below would otherwise call flock() on a closed
+            // handle. In PHP 8 that throws a TypeError that `@` cannot
+            // suppress, i.e. a fatal 500 on /manifest.json whenever the cache is
+            // cold and this request lost the single-flight race (observed as
+            // `Uncaught TypeError: flock(): Argument #1 ($stream) must be an
+            // open stream resource` right after a dyno restart).
             @fclose($lockFp);
+            $lockFp = null;
         }
         $stale = $readCache();
         if (!empty($stale)) {
@@ -8485,14 +9385,21 @@ function fd_load_catalog_settings(): array
         // AIOMetadata (and any other upstream) from injecting unwanted
         // catalogs into Nuvio/Stremio.
         'upstream_enabled' => true,
-        // Fresh installs ship with AIOMetadata as the default upstream so
-        // external IDs (tt/tmdb/tvdb/mal/kitsu/...) resolve to real titles even
-        // when Cinemeta has no entry. An existing storage/catalog_settings.json
-        // always overrides this (see the merge below), so user edits are kept.
+        // Fresh installs ship with two upstreams:
+        //   1. AIOMetadata — resolves external IDs (tt/tmdb/tvdb/mal/kitsu/...)
+        //      to real titles even when Cinemeta has no entry.
+        //   2. OpenSubtitles v3 — subtitles-only (no catalogs, no meta, no
+        //      streams). Its only job is to answer /subtitles/{type}/{tt…}.json.
+        // An existing storage/catalog_settings.json always overrides this (see
+        // the merge below), so user edits are kept.
         'upstream_manifests' => [
             [
                 'url'  => FD_DEFAULT_UPSTREAM_MANIFEST_URL,
                 'name' => FD_DEFAULT_UPSTREAM_MANIFEST_NAME,
+            ],
+            [
+                'url'  => FD_DEFAULT_SUBTITLE_MANIFEST_URL,
+                'name' => FD_DEFAULT_SUBTITLE_MANIFEST_NAME,
             ],
         ],
         'stream_config' => [
@@ -8528,6 +9435,7 @@ function fd_load_catalog_settings(): array
             'max_size_gb' => 0,
             'exclude_cam' => false,
             'exclude_unplayable' => true,
+            'exclude_part_title' => true,
             'excluded_keywords' => '',
             'required_keywords' => '',
         ],
@@ -8585,6 +9493,39 @@ function fd_load_catalog_settings(): array
                 }));
                 if (!empty($fileManifests)) {
                     $defaults['upstream_manifests'] = $fileManifests;
+
+                    // One-time seed of the default subtitle addon for installs
+                    // whose settings file predates it. Guarded by
+                    // FD_SUBTITLE_SEED_KEY so a user who deletes OpenSubtitles v3
+                    // from Catalog Configuration never has it resurrected (the
+                    // exact complaint that made the AIOMetadata default opt-out).
+                    $hasSubtitleDefault = false;
+                    foreach ($fileManifests as $fm) {
+                        if (stripos((string) ($fm['url'] ?? ''), FD_DEFAULT_SUBTITLE_HOST) !== false) {
+                            $hasSubtitleDefault = true;
+                            break;
+                        }
+                    }
+                    if (!$hasSubtitleDefault && empty($data[FD_SUBTITLE_SEED_KEY])) {
+                        $subtitleSeed = [
+                            'url'  => FD_DEFAULT_SUBTITLE_MANIFEST_URL,
+                            'name' => FD_DEFAULT_SUBTITLE_MANIFEST_NAME,
+                        ];
+                        $defaults['upstream_manifests'][] = $subtitleSeed;
+                        // The FILE must get the entry too — writing only the
+                        // marker left the seeded addon out of the list entirely
+                        // (settings showed seed=true with a single upstream).
+                        // Writing $fileManifests also normalises the file by
+                        // dropping entries that carry no URL.
+                        $data['upstream_manifests'] = array_merge($fileManifests, [$subtitleSeed]);
+                        $data[FD_SUBTITLE_SEED_KEY] = true;
+                        fd_log('seeded default subtitle upstream', ['url' => FD_DEFAULT_SUBTITLE_MANIFEST_URL]);
+                        @file_put_contents(
+                            $path,
+                            json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
+                            LOCK_EX
+                        );
+                    }
                 }
             }
             if (isset($data['stream_config']) && is_array($data['stream_config'])) {
@@ -8637,6 +9578,9 @@ function fd_load_catalog_settings(): array
                 }
                 if (isset($sc['exclude_unplayable'])) {
                     $defaults['stream_config']['exclude_unplayable'] = (bool) $sc['exclude_unplayable'];
+                }
+                if (isset($sc['exclude_part_title'])) {
+                    $defaults['stream_config']['exclude_part_title'] = (bool) $sc['exclude_part_title'];
                 }
                 if (isset($sc['excluded_keywords'])) {
                     $defaults['stream_config']['excluded_keywords'] = trim((string) $sc['excluded_keywords']);
@@ -11426,6 +12370,9 @@ if ($isNuvioRoute) {
 
     // ── Nuvio / Stremio Manifest ──
     if ($addonPath === '/manifest.json') {
+        // Stremio/Nuvio fetch the manifest on start and on every addon refresh,
+        // which is the earliest point we can start the IPC worker booting.
+        fd_prewarm_ipc_worker();
         $settingsFile = fd_storage_path('storage/catalog_settings.json');
         $trendingFile = fd_cache_path('trending_keywords.json');
         $mKeyParts = (string)($_SERVER['HTTP_HOST'] ?? '') . '_' .
@@ -11803,18 +12750,13 @@ if ($isNuvioRoute) {
             $mId = trim((string)($upstream['id'] ?? ('up' . $uIdx)));
             $mName = trim((string)($upstream['name'] ?? 'Addon'));
 
-            // Cache upstream manifest JSON on disk for 2 hours
-            $mCacheFile = fd_storage_path('storage/upstream_manifest_' . md5($mUrl) . '.json');
-            $mJson = null;
-            if (is_file($mCacheFile) && (time() - (int)filemtime($mCacheFile)) < 7200) {
-                $mJson = json_decode((string)@file_get_contents($mCacheFile), true);
-            }
-            if (!is_array($mJson) || empty($mJson['catalogs'])) {
-                $mJson = fd_http_json($mUrl, [], 'GET', 6);
-                if (is_array($mJson) && !empty($mJson['catalogs'])) {
-                    @file_put_contents($mCacheFile, json_encode($mJson, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
-                }
-            }
+            // Cached via fd_upstream_manifest_json() — cached whenever the
+            // response is a valid addon descriptor, NOT only when it lists
+            // catalogs. A subtitles-only upstream (OpenSubtitles v3) declares
+            // `catalogs: []`, and the old inline `empty($mJson['catalogs'])`
+            // check made every request a cache miss, so serving /manifest.json
+            // paid a blocking HTTP call on every single load.
+            $mJson = fd_upstream_manifest_json($mUrl);
 
             if (is_array($mJson) && !empty($mJson['catalogs']) && is_array($mJson['catalogs'])) {
                 foreach ($mJson['catalogs'] as $uCat) {
@@ -12903,6 +13845,11 @@ if ($isNuvioRoute) {
         $itemType = urldecode($matches[1]);
         $itemId = urldecode(urldecode($matches[2])); // Handle double-encoded IDs from web clients
 
+        // The stream LIST (usually a cache hit) is handed to the player just
+        // before it starts pulling bytes, so this is the right moment to make
+        // sure the shared IPC worker is booting.
+        fd_prewarm_ipc_worker();
+
         fd_log('stremio stream request received', [
             'itemType' => $itemType,
             'itemId' => $itemId,
@@ -13528,6 +14475,7 @@ if ($isNuvioRoute) {
         $visualFilter = $streamConfig['visual_tags'] ?? ['hdr' => true, 'dv' => true];
         $excludeCam = !empty($streamConfig['exclude_cam']);
         $excludeUnplayable = isset($streamConfig['exclude_unplayable']) ? !empty($streamConfig['exclude_unplayable']) : true;
+        $excludePartTitle = !empty($streamConfig['exclude_part_title']);
         $preferredRes = $streamConfig['preferred_resolution'] ?? 'auto';
         $maxPerRes = max(0, (int)($streamConfig['max_streams_per_resolution'] ?? 0));
         $maxTotal = max(0, (int)($streamConfig['max_streams_total'] ?? 0));
@@ -13649,6 +14597,20 @@ if ($isNuvioRoute) {
                     }
                 }
                 if (!$hasRequiredKw) continue;
+            }
+
+            // 8. Exclude Part Titles filter — drop streams that are one part of a
+            //    split release ("Movie.Part.1.mkv", "part001", "Movie.mkv.001"), which
+            //    would play only a fragment of the movie. The flag is set by
+            //    fd_group_split_parts() above, so this reuses the existing detector.
+            //    ponytail: title-based detection means a real movie with a number in its
+            //    name ("Dune Part 2") is also caught, hence the single toggle below.
+            //    NOTE this toggle is ON by default ('exclude_part_title' => true in
+            //    fd_load_catalog_settings()), so fd_extract_split_part_info() must never
+            //    flag a codec suffix as a part — see the H.263/H.264/H.265 guard there,
+            //    otherwise the most common encodes disappear from every stream list.
+            if ($excludePartTitle && !empty($fItem['is_split_part'])) {
+                continue;
             }
 
             $fItem['_resKey'] = $rKey;
@@ -14552,6 +15514,9 @@ if (str_starts_with($path, '/api/')) {
             if (isset($inSc['exclude_unplayable'])) {
                 $current['stream_config']['exclude_unplayable'] = (bool) $inSc['exclude_unplayable'];
             }
+            if (isset($inSc['exclude_part_title'])) {
+                $current['stream_config']['exclude_part_title'] = (bool) $inSc['exclude_part_title'];
+            }
             if (isset($inSc['excluded_keywords'])) {
                 $current['stream_config']['excluded_keywords'] = trim((string) $inSc['excluded_keywords']);
             }
@@ -14734,6 +15699,13 @@ if (str_starts_with($path, '/api/')) {
         $hasSession = fd_has_local_session() && $botId !== '';
         $pool = fd_get_bot_pool();
 
+        // Warm the shared IPC worker in the background (non-blocking, throttled)
+        // so the first playback does not pay a ~15s full-mode boot while holding
+        // a worker thread. See fd_prewarm_ipc_worker().
+        if ($hasSession) {
+            fd_prewarm_ipc_worker();
+        }
+
         // If meta username/name is empty, fill from bot pool
         $botUsername = (string) ($meta['bot_username'] ?? '');
         $botName = (string) ($meta['bot_name'] ?? '');
@@ -14780,6 +15752,7 @@ if (str_starts_with($path, '/api/')) {
     // Lets the frontend warn the user BEFORE attempting a bot login, since a
     // skewed clock makes every MTProto handshake fail with a confusing
     // "message ID too new/old" error.
+
     if ($path === '/api/clock-check' && $method === 'GET') {
         $probe = fd_measure_clock_offset();
         $abs = abs((int) $probe['offset']);

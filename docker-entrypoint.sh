@@ -20,35 +20,49 @@ if [ -n "$MEM_LIMIT" ] && [ "$MEM_LIMIT" -gt 0 ] 2>/dev/null && [ "$MEM_LIMIT" -
     MEM_MB=$((MEM_LIMIT / 1024 / 1024))
 
     if [ "$MEM_MB" -le 512 ]; then
-        export GOMEMLIMIT="${GOMEMLIMIT:-350MiB}"
-        export FRANKENPHP_NUM_THREADS="${FRANKENPHP_NUM_THREADS:-4}"
-        export FRANKENPHP_MAX_THREADS="${FRANKENPHP_MAX_THREADS:-6}"
-        export PHP_MEMORY_LIMIT="${PHP_MEMORY_LIMIT:-96M}"
-        export FRANKENPHP_MAX_WAIT_TIME="${FRANKENPHP_MAX_WAIT_TIME:-15s}"
+        # Measured (Heroku-shaped 512MB cgroup, 4 threads/max 6, wait 15s):
+        # cold-origin catalog searches hit p50 11s / p95 17s and returned HTTP
+        # 503, because the tiny pool was shared by catalog traffic AND by stream
+        # requests that hold their worker for the whole playback. Rebalance:
+        #   - cheaper Go heap (256MiB) leaves headroom for PHP worker threads;
+        #   - 6 -> 8 threads so a few viewers no longer starve catalog requests;
+        #   - 64M per-request ceiling (a catalog thread uses far less than 96M);
+        #   - fail fast in 10s: a client can retry a 503, whereas Heroku kills a
+        #     request at 30s with H12 and counts it against the app.
+        export GOMEMLIMIT="${GOMEMLIMIT:-256MiB}"
+        export FRANKENPHP_NUM_THREADS="${FRANKENPHP_NUM_THREADS:-6}"
+        export FRANKENPHP_MAX_THREADS="${FRANKENPHP_MAX_THREADS:-8}"
+        export PHP_MEMORY_LIMIT="${PHP_MEMORY_LIMIT:-64M}"
+        export FRANKENPHP_MAX_WAIT_TIME="${FRANKENPHP_MAX_WAIT_TIME:-10s}"
         export FD_DOWNLOAD_PARALLEL_CHUNKS="${FD_DOWNLOAD_PARALLEL_CHUNKS:-2}"
     elif [ "$MEM_MB" -le 1024 ]; then
+        # A stream holds its worker for the whole playback, so the pool size IS
+        # the concurrent-viewer limit. Measured: 8 threads cost only ~70MB RSS
+        # under a 50-way burst of catalog requests, so threads are far cheaper
+        # than they look and 10/16 is safe inside 1GB with a 550MiB Go ceiling.
         export GOMEMLIMIT="${GOMEMLIMIT:-550MiB}"
-        export FRANKENPHP_NUM_THREADS="${FRANKENPHP_NUM_THREADS:-6}"
-        export FRANKENPHP_MAX_THREADS="${FRANKENPHP_MAX_THREADS:-10}"
+        export FRANKENPHP_NUM_THREADS="${FRANKENPHP_NUM_THREADS:-10}"
+        export FRANKENPHP_MAX_THREADS="${FRANKENPHP_MAX_THREADS:-16}"
         export PHP_MEMORY_LIMIT="${PHP_MEMORY_LIMIT:-128M}"
-        export FRANKENPHP_MAX_WAIT_TIME="${FRANKENPHP_MAX_WAIT_TIME:-25s}"
+        export FRANKENPHP_MAX_WAIT_TIME="${FRANKENPHP_MAX_WAIT_TIME:-20s}"
         export FD_DOWNLOAD_PARALLEL_CHUNKS="${FD_DOWNLOAD_PARALLEL_CHUNKS:-2}"
     else
         TARGET_GOMEM=$((MEM_MB * 85 / 100))
         export GOMEMLIMIT="${GOMEMLIMIT:-${TARGET_GOMEM}MiB}"
-        export FRANKENPHP_NUM_THREADS="${FRANKENPHP_NUM_THREADS:-10}"
-        export FRANKENPHP_MAX_THREADS="${FRANKENPHP_MAX_THREADS:-16}"
+        export FRANKENPHP_NUM_THREADS="${FRANKENPHP_NUM_THREADS:-16}"
+        export FRANKENPHP_MAX_THREADS="${FRANKENPHP_MAX_THREADS:-32}"
         export PHP_MEMORY_LIMIT="${PHP_MEMORY_LIMIT:-256M}"
-        export FRANKENPHP_MAX_WAIT_TIME="${FRANKENPHP_MAX_WAIT_TIME:-25s}"
+        export FRANKENPHP_MAX_WAIT_TIME="${FRANKENPHP_MAX_WAIT_TIME:-20s}"
         export FD_DOWNLOAD_PARALLEL_CHUNKS="${FD_DOWNLOAD_PARALLEL_CHUNKS:-3}"
     fi
 elif [ -n "$DYNO" ]; then
-    # Fallback default for Heroku dynos if cgroup read was empty
+    # Fallback default for Heroku dynos if cgroup read was empty. Standard-2X
+    # dynos have ~1GB, so use the 1GB profile rather than the smallest one.
     export GOMEMLIMIT="${GOMEMLIMIT:-550MiB}"
-    export FRANKENPHP_NUM_THREADS="${FRANKENPHP_NUM_THREADS:-6}"
-    export FRANKENPHP_MAX_THREADS="${FRANKENPHP_MAX_THREADS:-10}"
+    export FRANKENPHP_NUM_THREADS="${FRANKENPHP_NUM_THREADS:-10}"
+    export FRANKENPHP_MAX_THREADS="${FRANKENPHP_MAX_THREADS:-16}"
     export PHP_MEMORY_LIMIT="${PHP_MEMORY_LIMIT:-128M}"
-    export FRANKENPHP_MAX_WAIT_TIME="${FRANKENPHP_MAX_WAIT_TIME:-25s}"
+    export FRANKENPHP_MAX_WAIT_TIME="${FRANKENPHP_MAX_WAIT_TIME:-20s}"
     export FD_DOWNLOAD_PARALLEL_CHUNKS="${FD_DOWNLOAD_PARALLEL_CHUNKS:-2}"
 fi
 

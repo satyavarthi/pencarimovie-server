@@ -71,6 +71,7 @@
 		file_server
 	}
 
+
 	@empty_static path /favicon.ico /robots.txt
 	handle @empty_static {
 		respond "" 204
