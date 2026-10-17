@@ -228,6 +228,21 @@ define('FD_SUBTITLE_SEED_KEY', 'subtitle_seed_v1');
 // in ~1ms and every other addon benefits from the same row.
 define('FD_SUBTITLE_ID_CACHE_TTL', 604800); // 7d for a resolved title -> tt
 
+// IMDb alternate-title (AKA) source, used when media_ids_idx has no `aka` for an id and
+// the upstream metas carry none either. `/title/{id}/akas` is served by the imdb-scr3 app
+// (github.com/aiskendi/imdb-scr3), which is now SELF-HOSTED on the VPS as a Docker
+// container (`127.0.0.1:3010`) behind nginx:
+//   * https://pencarimovie.com/imdb-api            — path form, live today
+//   * https://imdb-api.pencarimovie.com            — same service at the root, once DNS
+//                                                    for that name points at the VPS and
+//                                                    the Cloudflare Worker route is removed
+//                                                    (the nginx server block + wildcard cert
+//                                                    are already in place and verified).
+// The old Cloudflare Worker deployment still answers on that hostname and is used if the
+// self-hosted base fails; if everything upstream fails, the release-info page is fetched as
+// markdown from r.jina.ai in THIS process (see fd_aka_from_imdb_releaseinfo()).
+define('FD_IMDB_AKA_API_BASE', (string) fd_env('FD_IMDB_AKA_API_BASE', 'https://pencarimovie.com/imdb-api'));
+
 function fd_cache_path(string $file): string
 {
     $dir = FD_CACHE_DIR;
@@ -1767,6 +1782,122 @@ function fd_http_json(string $url, array $payload = [], string $method = 'GET', 
 }
 
 /**
+ * Cache-first GET for a WordPress REST URL that must keep its WHOLE decoded body.
+ *
+ * `fd_fetch_stream_ajax()` cannot be used for these routes: it unwraps `data`/`items` and throws
+ * away `ok`, `resolved_title`, `resolved_year` and `total`, which the movie and series fast paths
+ * read. This offers the same single-flight + stale-while-revalidate contract otherwise.
+ *
+ * Why it exists: the two `stream-files` fast paths called `fd_http_json()` directly, so the single
+ * heaviest WordPress call in the app was NEVER cached and never coalesced. From a live log:
+ * `stream-files?type=series&…&title=Carrie` 1.647 s, the same route for `title=Breaking Bad`
+ * exceeded 15 s and was cancelled outright, and a repeat visit re-paid all of it.
+ *
+ * `$ttl` is deliberately shorter than the 300 s `/stream/*` response cache so the inner copy can
+ * never be the stale one.
+ */
+function fd_cached_wp_json(string $fullUrl, int $timeout = 8, int $ttl = 180, int $staleMax = 21600): array
+{
+    $cacheFile = fd_cache_path('wp_json_' . md5($fullUrl) . '.json');
+    // Origin-health flag consumed by fd_prewarm_stream_list(): set when an answer is slow or
+    // cancelled, cleared when the origin is quick again.
+    $slowFile  = fd_cache_path('wp_slow.marker');
+
+    $readCache = static function (int $maxAge) use ($cacheFile): ?array {
+        if (!is_file($cacheFile)) {
+            return null;
+        }
+        if ($maxAge > 0 && (time() - (int) @filemtime($cacheFile)) > $maxAge) {
+            return null;
+        }
+        $decoded = json_decode((string) @file_get_contents($cacheFile), true);
+        return is_array($decoded) ? $decoded : null;
+    };
+
+    $fresh = $readCache($ttl);
+    if ($fresh !== null) {
+        return $fresh;
+    }
+    $stale = $readCache($staleMax);
+
+    // Single-flight: exactly one worker refreshes a given URL. Without this a burst of concurrent
+    // requests for the same uncached URL each opened its own origin connection.
+    $lockFp = @fopen($cacheFile . '.lock', 'c');
+    $isRefresher = $lockFp ? @flock($lockFp, LOCK_EX | LOCK_NB) : false;
+
+    if (!$isRefresher) {
+        if ($stale !== null) {
+            return $stale;
+        }
+        // Nothing cached: give the in-flight refresher a brief chance rather than racing it.
+        $deadline = microtime(true) + min(3.0, (float) $timeout);
+        while (microtime(true) < $deadline) {
+            usleep(100000);
+            $fresh = $readCache($ttl);
+            if ($fresh !== null) {
+                return $fresh;
+            }
+        }
+        return $stale ?? [];
+    }
+
+    $fetchStart = microtime(true);
+    try {
+        $headers = [
+            'Accept: application/json',
+            'X-App-Version: ' . FD_APP_VERSION,
+        ];
+        $apiSecret = fd_get_api_secret();
+        if ($apiSecret !== '') {
+            $headers[] = "X-API-Secret: $apiSecret";
+        }
+        $body = fd_http_get_contents($fullUrl, [
+            'method' => 'GET',
+            'headers' => $headers,
+            'timeout' => $timeout,
+        ]);
+        $fetchElapsed = microtime(true) - $fetchStart;
+        // Publish the origin's health so the prewarm can back off (see $slowFile above). A slow
+        // answer means the NEXT warm would compete with a real request; a quick one clears it.
+        if ($fetchElapsed > 4.0) {
+            @touch($slowFile);
+        } elseif (is_file($slowFile)) {
+            @unlink($slowFile);
+        }
+        if (is_string($body) && $body !== '') {
+            $decoded = json_decode($body, true);
+            if (is_array($decoded)) {
+                // Only a real answer is cached: an error body must not poison the entry.
+                if (!empty($decoded['ok'])) {
+                    @file_put_contents(
+                        $cacheFile,
+                        json_encode($decoded, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
+                        LOCK_EX
+                    );
+                }
+                return $decoded;
+            }
+        }
+        fd_log('cached wp json fetch empty', ['url' => $fullUrl, 'had_stale' => $stale !== null]);
+        return $stale ?? [];
+    } catch (\Throwable $e) {
+        // A cancellation/timeout is the strongest signal that the origin is struggling right now.
+        @touch($slowFile);
+        fd_log('cached wp json fetch failed', [
+            'url' => $fullUrl,
+            'error' => $e->getMessage(),
+            'elapsed_seconds' => round(microtime(true) - $fetchStart, 3),
+        ]);
+        return $stale ?? [];
+    } finally {
+        if ($lockFp) {
+            @flock($lockFp, LOCK_UN);
+            @fclose($lockFp);
+        }
+    }
+}
+
+/**
  * Low-level HTTP fetch using curl (preferred) or file_get_contents (fallback).
  *
  * Uses curl when available because bundled PHP 8.5 on Windows has unreliable
@@ -2778,12 +2909,17 @@ function fd_resolve_external_media_metadata(string $itemId, string $itemType = '
         //    is what makes repeat requests instant (~1ms).
         $cacheFile = fd_cache_path('ext_meta_' . md5($imdbId) . '.json');
         $akaTitle = '';
+        $cachedAka = '';
         if (is_file($cacheFile) && (time() - (int)filemtime($cacheFile)) < 86400) {
             $cData = json_decode((string)@file_get_contents($cacheFile), true);
             if (is_array($cData) && !empty($cData['name'])) {
                 $title = (string) $cData['name'];
                 $year = (string) ($cData['year'] ?? '');
                 $akaTitle = (string) ($cData['aka'] ?? '');
+            }
+            // The aka can be in this file even when name/year were resolved elsewhere.
+            if (is_array($cData)) {
+                $cachedAka = (string) ($cData['aka'] ?? '');
             }
         }
 
@@ -2795,6 +2931,14 @@ function fd_resolve_external_media_metadata(string $itemId, string $itemType = '
                 $title = (string) $wpLookup['title'];
                 $year = (string) ($wpLookup['year'] ?? '');
                 $akaTitle = (string) ($wpLookup['aka'] ?? '');
+                // NEVER let a blank value overwrite an aka we already resolved. This file is
+                // written by several paths (the `/stream-files` fast path writes `aka: ''`
+                // without asking anyone), and a blank write made every subsequent request
+                // re-derive the AKA — and re-POST /media-ids — even though the media_ids_idx
+                // row already carried it.
+                if ($akaTitle === '') {
+                    $akaTitle = $cachedAka;
+                }
                 @file_put_contents($cacheFile, json_encode(['name' => $title, 'year' => $year, 'aka' => $akaTitle], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
             }
         }
@@ -3649,7 +3793,7 @@ function fd_resolve_shortcode(string $shortCode, string $botId = '', bool $bypas
  * Fire-and-forget asynchronous HTTP request to hit and trigger warmup without blocking.
  * Opens a non-blocking TCP socket, sends the HTTP request, and closes immediately.
  */
-function fd_http_fire_and_forget(string $url, array $payload = [], string $method = 'POST'): void
+function fd_http_fire_and_forget(string $url, array $payload = [], string $method = 'POST', string $hostHeader = ''): void
 {
     $parts = parse_url($url);
     if (!$parts || empty($parts['host'])) {
@@ -3670,7 +3814,10 @@ function fd_http_fire_and_forget(string $url, array $payload = [], string $metho
     }
 
     $req = "{$method} {$path} HTTP/1.1\r\n";
-    $req .= "Host: {$host}\r\n";
+    // `$hostHeader` lets a warm reach us on 127.0.0.1 while still claiming the host the CLIENT
+    // used: the `/stream` response cache is keyed on the base URL derived from the request, so a
+    // warm that announces itself as 127.0.0.1 would warm a key nobody asks for.
+    $req .= "Host: " . ($hostHeader !== '' ? $hostHeader : $host) . "\r\n";
     $req .= "User-Agent: pencarimovie-server/" . FD_APP_VERSION . "\r\n";
     $req .= "Accept: application/json\r\n";
     if ($secret !== '') {
@@ -3704,6 +3851,88 @@ function fd_http_fire_and_forget(string $url, array $payload = [], string $metho
 }
 
 /**
+ * Warm ONE stream list while the user is still reading the info page, so the Play button is
+ * already served from cache.
+ *
+ * WHY FIRE-AND-FORGET AND NOT `Amp\async()`. Amp concurrency lives INSIDE a request: when the
+ * `/meta` handler returns, its pending fibers are destroyed. Under FrankenPHP there is no
+ * `fastcgi_finish_request()` (that is PHP-FPM only) and this app does not run in FrankenPHP worker
+ * mode, so there is no post-response hook — an in-process future that outlives the response does
+ * not exist, and an un-awaited `Amp\async()` here would simply be lost. Opening a loopback
+ * connection and closing it puts the work on a DIFFERENT worker thread that owes nothing to this
+ * request. That also avoids the alternative used elsewhere (`fd_spawn_backend_cli()`), which costs
+ * a whole PHP process per warm.
+ *
+ * The loopback URL is the REAL `/stream` route, so whatever it caches is by construction the same
+ * keys the Play request will look for: no cache-key drift, and no second copy of the URL shape
+ * (`season`/`episode`/`title` keyword included). That is why this warms the route and not
+ * `stream-files` directly — meta does not always know the exact query the stream route will build.
+ *
+ * Throttled twice, because `/meta` is requested for every item a user browses: once per item, and
+ * once globally, so a catalog browse cannot occupy the whole thread pool.
+ */
+function fd_prewarm_stream_list(string $itemType, string $itemId): bool
+{
+    $itemType = trim($itemType);
+    $itemId   = trim($itemId);
+    if ($itemType === '' || $itemId === '') {
+        return false;
+    }
+    // Only ids our own routes answer for; anything else would burn a worker thread on a 404.
+    if (!preg_match('#^(?:pm:|pm_|tt\d)#i', $itemId)) {
+        return false;
+    }
+    // Only warm when the id the CLIENT gave us already determines the key.
+    //
+    // A series root meta (`pm:post:8798809532`, no `:S:E`) does NOT determine it: the episode is
+    // chosen later, when Play is pressed. Guessing S01E01 was measured to be actively HARMFUL —
+    // live log, `pm:post:8798800597`: the warm fetched episode 1 (16.5 s, and it timed out at 15 s
+    // and retried) while the user played episode **2** four seconds later, a different key. So the
+    // warm helped nothing and added a competing `stream-files` query plus its retry to the origin.
+    // Series are therefore skipped unless meta carries an explicit `:S:E`.
+    $isSeriesType = str_contains(strtolower($itemType), 'series') || str_contains(strtolower($itemType), 'tv');
+    if ($isSeriesType && !preg_match('#:\d+:\d+$#', $itemId)) {
+        return false;
+    }
+
+    // Never warm while the origin is known to be slow. That is exactly when a warm is worst: it
+    // competes with the user's own request for the same post's Manticore query, and both end up
+    // cancelled at the timeout and retried (measured: `stream-files` cancelled at 15 s, then the
+    // retry answered in 1.3-1.5 s). fd_cached_wp_json() raises this flag whenever a response takes
+    // too long or is cancelled, and clears it on a fast one.
+    $slowOrigin = fd_cache_path('wp_slow.marker');
+    if (is_file($slowOrigin) && (time() - (int) @filemtime($slowOrigin)) < 60) {
+        return false;
+    }
+
+    $perItem = fd_cache_path('prewarm_item_' . md5($itemType . '|' . $itemId) . '.marker');
+    if (is_file($perItem) && (time() - (int) @filemtime($perItem)) < 300) {
+        return false;
+    }
+    $global = fd_cache_path('prewarm_global.marker');
+    if (is_file($global) && (time() - (int) @filemtime($global)) < 1) {
+        return false;
+    }
+    @touch($global);
+    @touch($perItem);
+
+    $port = (string) ($_SERVER['SERVER_PORT'] ?? '8088');
+    $url  = 'http://127.0.0.1:' . $port . '/stream/' . rawurlencode($itemType)
+        . '/' . rawurlencode($itemId) . '.json';
+    // Claim the host the client used (LAN IP, tunnel, or localhost) so the `/stream` response
+    // cache key matches what Play will ask for; the connection itself still goes to 127.0.0.1.
+    $hostHeader = trim((string) ($_SERVER['HTTP_HOST'] ?? ''));
+    if ($hostHeader === '' || str_contains($hostHeader, "\r") || str_contains($hostHeader, "\n")) {
+        $hostHeader = '';
+    }
+    // Deliberately NO force=1: a fresh cache answers this in milliseconds (nothing to do), while a
+    // missing or stale one makes the route do the real work and populate the caches.
+    fd_http_fire_and_forget($url, [], 'GET', $hostHeader);
+    fd_log('stream list prewarm fired', ['itemType' => $itemType, 'itemId' => $itemId]);
+    return true;
+}
+
+/**
  * Spawns a background detached CLI process or async request to resolve missing
  * short_codes into storage/cache/resolve_cache_*.json without blocking.
  */
@@ -3732,37 +3961,6 @@ function fd_spawn_warmup_resolve(array $shortCodes, string $botId = '', string $
     }
 
     $chunk = array_slice($missing, 0, 40);
-    $root = fd_get_app_root();
-
-    // Determine PHP CLI binary
-    $phpBin = PHP_BINARY;
-    if (PHP_SAPI !== 'cli' && PHP_SAPI !== 'phpdbg') {
-        $prefix = (string) fd_env('PREFIX', '');
-        if ($prefix !== '' && is_file($prefix . '/bin/php')) {
-            $phpBin = $prefix . '/bin/php';
-        } else {
-            $candidate = $root . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . (fd_is_windows() ? 'php.exe' : 'php');
-            if (is_file($candidate)) {
-                $phpBin = $candidate;
-            } elseif (is_file($root . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . (fd_is_windows() ? 'frankenphp.exe' : 'frankenphp'))) {
-                $phpBin = $root . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . (fd_is_windows() ? 'frankenphp.exe' : 'frankenphp') . ' php-cli';
-            }
-        }
-    }
-
-    $backendScript = $root . DIRECTORY_SEPARATOR . 'backend.php';
-    if (!is_file($backendScript)) {
-        $backendScript = __DIR__ . DIRECTORY_SEPARATOR . 'backend.php';
-    }
-
-    $codesArg = implode(',', $chunk);
-    $cmd = '"' . $phpBin . '"'
-        . ' -dhtml_errors=0 -ddisplay_errors=0 -dlog_errors=1'
-        . ' "' . $backendScript . '"'
-        . ' warmup'
-        . ' "' . addslashes($codesArg) . '"'
-        . ' "' . addslashes($botId) . '"'
-        . ' "' . addslashes($context) . '"';
 
     fd_log('spawning background warmup resolve', [
         'context' => $context !== '' ? $context : 'batch',
@@ -3771,12 +3969,68 @@ function fd_spawn_warmup_resolve(array $shortCodes, string $botId = '', string $
         'sample_codes' => array_slice($chunk, 0, 3),
     ]);
 
-    if (fd_is_windows()) {
-        @pclose(@popen('start "" /b ' . $cmd . ' > NUL 2>&1', 'r'));
-    } else {
-        @shell_exec('nohup ' . $cmd . ' > /dev/null 2>&1 &');
+    fd_spawn_backend_cli(['warmup', implode(',', $chunk), $botId, $context]);
+
+    return true;
+}
+
+/**
+ * Spawn a DETACHED CLI process running `backend.php <args…>`.
+ *
+ * Every web SAPI here is short-lived — a FrankenPHP request, or the PHP built-in server — so
+ * work that does not belong on the request path has to happen in its own process. Doing it
+ * inline does not "save" the cost, it just moves it into the response: the relay
+ * registration measured 8.0-9.4 s and a `media_ids` persist 2-4.6 s, both while occupying a
+ * worker that a real request was queueing behind.
+ *
+ * The command is built the same way `fd_spawn_warmup_resolve()` always built it: the bundled
+ * `bin/php` (or the Termux prefix), then `backend.php`, then the action and its arguments.
+ *
+ * Returns false when no process could be spawned — including for the CLI SAPI itself, where
+ * the caller simply must do the work inline.
+ */
+function fd_spawn_backend_cli(array $args): bool
+{
+    if (PHP_SAPI === 'cli' || PHP_SAPI === 'phpdbg') {
+        return false;
     }
 
+    $root = fd_get_app_root();
+
+    // Determine PHP CLI binary
+    $phpBin = PHP_BINARY;
+    $prefix = (string) fd_env('PREFIX', '');
+    if ($prefix !== '' && is_file($prefix . '/bin/php')) {
+        $phpBin = $prefix . '/bin/php';
+    } else {
+        $candidate = $root . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . (fd_is_windows() ? 'php.exe' : 'php');
+        if (is_file($candidate)) {
+            $phpBin = $candidate;
+        } elseif (is_file($root . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . (fd_is_windows() ? 'frankenphp.exe' : 'frankenphp'))) {
+            $phpBin = $root . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . (fd_is_windows() ? 'frankenphp.exe' : 'frankenphp') . ' php-cli';
+        }
+    }
+
+    $backendScript = $root . DIRECTORY_SEPARATOR . 'backend.php';
+    if (!is_file($backendScript)) {
+        $backendScript = __DIR__ . DIRECTORY_SEPARATOR . 'backend.php';
+    }
+
+    $cmd = '"' . $phpBin . '"'
+        . ' -dhtml_errors=0 -ddisplay_errors=0 -dlog_errors=1'
+        . ' "' . $backendScript . '"';
+    foreach ($args as $arg) {
+        $cmd .= ' "' . addslashes((string) $arg) . '"';
+    }
+
+    if (fd_is_windows()) {
+        // `start "" /b` via popen: PowerShell Start-Process keeps the child inside the
+        // FrankenPHP job object and it is killed when the request ends.
+        @pclose(@popen('start "" /b ' . $cmd . ' > NUL 2>&1', 'r'));
+        return true;
+    }
+
+    @shell_exec('nohup ' . $cmd . ' > /dev/null 2>&1 &');
     return true;
 }
 
@@ -4292,38 +4546,73 @@ function fd_lookup_catalog_post_identity(int $postId): array
         return $empty;
     }
     $cacheFile = fd_cache_path('post_identity_' . $postId . '.json');
-    if (is_file($cacheFile)) {
-        $mtime = (int) @filemtime($cacheFile);
+    $readCached = static function () use ($cacheFile): ?array {
+        if (!is_file($cacheFile)) {
+            return null;
+        }
         $cached = json_decode((string) @file_get_contents($cacheFile), true);
-        if (is_array($cached)) {
-            $ttl = !empty($cached['imdb_id']) ? FD_SUBTITLE_ID_CACHE_TTL : 900;
-            if ((time() - $mtime) < $ttl) {
-                return $cached + $empty;
+        return is_array($cached) ? $cached : null;
+    };
+    $cached = $readCached();
+    if ($cached !== null) {
+        $ttl = !empty($cached['imdb_id']) ? FD_SUBTITLE_ID_CACHE_TTL : 900;
+        if ((time() - (int) @filemtime($cacheFile)) < $ttl) {
+            return $cached + $empty;
+        }
+    }
+
+    // Single-flight. The stream path and the subtitles path ask for the SAME id concurrently, and
+    // with no lock both missed the cache and both opened a connection — live log, same second:
+    // `lookup-id?prefix=post&id=9001801064` completed in 0.435 s and again in 0.148 s. One caller
+    // fetches now; the others wait briefly for the file it publishes.
+    $lockFp = @fopen($cacheFile . '.lock', 'c');
+    $isRefresher = $lockFp ? @flock($lockFp, LOCK_EX | LOCK_NB) : false;
+    if (!$isRefresher) {
+        // Wait longer than the leader's own 4 s HTTP timeout, or the follower gives up first and
+        // races it — measured: the leader's `lookup-id` took 2.972 s while this window was 2.5 s,
+        // so the follower timed out and fired a SECOND request (0.07 s) instead of reusing the
+        // result. The fallback below is still to fetch it ourselves, which beats returning nothing.
+        $deadline = microtime(true) + 5.0;
+        while (microtime(true) < $deadline) {
+            usleep(100000);
+            $peer = $readCached();
+            if ($peer !== null) {
+                if ($lockFp) {
+                    @fclose($lockFp);
+                }
+                return $peer + $empty;
             }
         }
     }
 
-    $res = fd_http_json(
-        FD_WP_API_BASE . '/lookup-id?' . http_build_query(['prefix' => 'post', 'id' => $postId]),
-        [],
-        'GET',
-        4
-    );
-    $out = [
-        'title'      => (string) ($res['title'] ?? ''),
-        'year'       => (string) ($res['year'] ?? ''),
-        'imdb_id'    => (string) ($res['imdb_id'] ?? ''),
-        'media_type' => (string) ($res['media_type'] ?? ''),
-        'aka'        => (string) ($res['aka'] ?? ''),
-    ];
-    if ($out['title'] !== '' || $out['imdb_id'] !== '') {
-        @file_put_contents(
-            $cacheFile,
-            json_encode($out, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
-            LOCK_EX
+    try {
+        $res = fd_http_json(
+            FD_WP_API_BASE . '/lookup-id?' . http_build_query(['prefix' => 'post', 'id' => $postId]),
+            [],
+            'GET',
+            4
         );
+        $out = [
+            'title'      => (string) ($res['title'] ?? ''),
+            'year'       => (string) ($res['year'] ?? ''),
+            'imdb_id'    => (string) ($res['imdb_id'] ?? ''),
+            'media_type' => (string) ($res['media_type'] ?? ''),
+            'aka'        => (string) ($res['aka'] ?? ''),
+        ];
+        if ($out['title'] !== '' || $out['imdb_id'] !== '') {
+            @file_put_contents(
+                $cacheFile,
+                json_encode($out, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
+                LOCK_EX
+            );
+        }
+        return $out;
+    } finally {
+        if ($lockFp) {
+            @flock($lockFp, LOCK_UN);
+            @fclose($lockFp);
+        }
     }
-    return $out;
 }
 
 /**
@@ -4539,74 +4828,626 @@ function fd_norm_title_for_match(string $title): string
 }
 
 /**
- * Write a resolved IMDb id back into media_ids_idx under one of our catalog
- * posts. WordPress adds the `post:`/`pm:` rows itself, so this permanently
- * fixes a post whose `imdb_id` was empty — every later request (and every other
- * addon) then takes the fast path.
+ * Write a resolved identity back into media_ids_idx.
+ *
+ * `$postId` is the row to repair: one of our catalog post ids (`pm:post:<id>`, the row a
+ * subtitle request resolves) or 0 for the id's own pseudo row (`9000000000 + imdb`, the row
+ * the aka path writes). WordPress adds the `post:`/`pm:` rows itself, so this permanently
+ * fixes a post whose `imdb_id` was empty — every later request (and every other addon) then
+ * takes the fast path.
+ *
+ * Destination, in order:
+ *   1. OUR OWN IMDb API (`POST {FD_IMDB_AKA_API_BASE}/media-ids/persist`). It already owns
+ *      every other identity write (the aka path), it runs next to WordPress, and it holds the
+ *      WordPress secret itself — so the backend no longer needs its own 12 s-timeout
+ *      `/media-ids` call. `fd_http_json()` already attaches the same secret as
+ *      `X-API-Secret`, which is what the route authenticates with.
+ *   2. The direct WordPress write, when the API is not configured, is unreachable, or
+ *      declines the write (an unknown year, API read-only).
+ *
+ * NOTE: `fd_media_ids_upsert()` must NOT be used for this. It schedules the POST with
+ * `Amp\async()` and returns before it runs, so the write is dropped when the request ends
+ * (measured: post 18056 still had an empty `imdb_id` after a "resolved and persisted" log
+ * line).
  */
-function fd_persist_imdb_id_for_post(int $postId, string $imdbId, string $title, string $year, string $type): void
+function fd_media_ids_write(int $postId, string $imdbId, string $title, string $year, string $type, string $aka = ''): bool
+{
+    $imdbId = trim($imdbId);
+    if ($imdbId === '' || !preg_match('/^tt\d{6,10}$/i', $imdbId)) {
+        return false;
+    }
+    $mediaType = (str_contains(strtolower($type), 'series') || str_contains(strtolower($type), 'tv')) ? 'tvseries' : 'movie';
+
+    $payload = [
+        'post_id'    => $postId,
+        'imdb_id'    => $imdbId,
+        'title'      => $title !== '' ? $title : $imdbId,
+        'year'       => (int) $year,
+        'media_type' => $mediaType,
+    ];
+    if ($aka !== '') {
+        // Never send an empty aka — it would blank a title an earlier request resolved.
+        $payload['aka'] = $aka;
+    }
+
+    if (FD_IMDB_AKA_API_BASE !== '') {
+        $res = fd_http_json(rtrim(FD_IMDB_AKA_API_BASE, '/') . '/media-ids/persist', $payload, 'POST', 10);
+        if (!empty($res['ok'])) {
+            return true;
+        }
+        fd_log('media-ids api write declined, using wordpress directly', [
+            'post_id' => $postId,
+            'imdb_id' => $imdbId,
+            'error'   => (string) ($res['error'] ?? ''),
+        ]);
+    }
+
+    if (!defined('FD_WP_API_BASE')) {
+        return false;
+    }
+
+    $numeric = (int) preg_replace('/\D/', '', $imdbId);
+    $payload['post_id'] = $postId > 0 ? $postId : (9000000000 + ($numeric % 1000000000));
+    // `post`/`pm` are sent EXPLICITLY as well: the REST handler synthesises them from
+    // post_id, but it used to drop that parameter entirely, and a caller must not depend
+    // on it.
+    $payload['media_ids'] = $postId > 0
+        ? ['imdb' => $imdbId, 'tt' => $imdbId, 'post' => (string) $postId, 'pm' => (string) $postId]
+        : ['imdb' => $imdbId, 'tt' => $imdbId];
+
+    $res = fd_http_json(FD_WP_API_BASE . '/media-ids', $payload, 'POST', 12);
+    return !empty($res['ok']) && (int) ($res['written'] ?? 0) > 0;
+}
+
+/**
+ * Persist the resolved IMDb id for one of our catalog posts.
+ *
+ * The on-disk identity cache is refreshed INLINE: it is a local write, and it is what makes
+ * the next request take the fast path. The `media_ids` write itself is a network round-trip
+ * (measured 3.4 s against WordPress) that only ever benefits FUTURE requests, so by default
+ * it is handed to a detached CLI worker and the subtitle request returns immediately. Pass
+ * `$async = false` to force it inline — the CLI worker does exactly that, so it can never
+ * re-spawn itself.
+ */
+function fd_persist_imdb_id_for_post(int $postId, string $imdbId, string $title, string $year, string $type, bool $async = true): void
 {
     if ($postId <= 0 || $imdbId === '') {
         return;
     }
     $mediaType = (str_contains(strtolower($type), 'series') || str_contains(strtolower($type), 'tv')) ? 'tvseries' : 'movie';
 
-    // NOTE: fd_media_ids_upsert() must NOT be used here. It schedules the write
-    // with Amp\async() and returns immediately without awaiting the future, and
-    // this route ends right after — the pending request is dropped and the row
-    // is never updated (measured: post 18056 still had an empty imdb_id after a
-    // "resolved and persisted" log line). The write has to be synchronous, and
-    // it needs a 12s timeout: the WordPress side regularly takes >5s, which made
-    // it return a spurious 500 from a slow client.
-    $written = 0;
-    if (defined('FD_WP_API_BASE')) {
-        $res = fd_http_json(
-            FD_WP_API_BASE . '/media-ids',
-            [
-                'post_id'    => $postId,
-                // `post`/`pm` are sent EXPLICITLY as well: the REST handler
-                // synthesises them from post_id, but it used to drop that
-                // parameter entirely, and a caller must not depend on it.
-                'media_ids'  => [
-                    'imdb' => $imdbId,
-                    'tt'   => $imdbId,
-                    'post' => (string) $postId,
-                    'pm'   => (string) $postId,
-                ],
-                'title'      => $title !== '' ? $title : $imdbId,
-                'year'       => (int) $year,
-                'imdb_id'    => $imdbId,
-                'media_type' => $mediaType,
-            ],
-            'POST',
-            12
-        );
-        $written = !empty($res['ok']) ? (int) ($res['written'] ?? 0) : 0;
+    // Refresh the identity cache so the next request takes the fast path. A previously
+    // resolved aka is PRESERVED — an empty one must never overwrite a title we already know
+    // (the same trap that made `ext_meta_` blank its aka on every request).
+    $identityFile = fd_cache_path('post_identity_' . $postId . '.json');
+    $prevAka = '';
+    if (is_file($identityFile)) {
+        $prev = json_decode((string) @file_get_contents($identityFile), true);
+        if (is_array($prev) && !empty($prev['aka'])) {
+            $prevAka = (string) $prev['aka'];
+        }
     }
-    if ($written === 0) {
+    @file_put_contents(
+        $identityFile,
+        json_encode([
+            'title'      => $title,
+            'year'       => $year,
+            'imdb_id'    => $imdbId,
+            'media_type' => $mediaType,
+            'aka'        => $prevAka,
+        ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
+        LOCK_EX
+    );
+
+    if ($async) {
+        $queued = fd_spawn_backend_cli([
+            'media-ids-persist',
+            (string) $postId,
+            $imdbId,
+            base64_encode($title),
+            $year,
+            $type,
+        ]);
+        if ($queued) {
+            fd_log('subtitle id resolved (write detached)', ['post_id' => $postId, 'imdb_id' => $imdbId]);
+            return;
+        }
+    }
+
+    $written = fd_media_ids_write($postId, $imdbId, $title, $year, $type);
+    if (!$written) {
         fd_log('subtitle id persist failed', [
             'post_id' => $postId,
             'imdb_id' => $imdbId,
             'title'   => $title,
         ]);
     }
-    // Refresh the identity cache so the next request takes the fast path.
-    @file_put_contents(
-        fd_cache_path('post_identity_' . $postId . '.json'),
-        json_encode([
-            'title'      => $title,
-            'year'       => $year,
-            'imdb_id'    => $imdbId,
-            'media_type' => $mediaType,
-            'aka'        => '',
-        ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
-        LOCK_EX
-    );
     fd_log('subtitle id resolved and persisted', [
         'post_id' => $postId,
         'imdb_id' => $imdbId,
         'title'   => $title,
     ]);
+}
+
+/**
+ * Parse the "Also known as (AKA)" list out of the markdown rendering of an IMDb
+ * release-info page.
+ *
+ * Group headings (`*   United Kingdom`) carry no indentation, alias titles are nested
+ * (`    *   Superstition`), and `(original title)` is itself a group heading — which is
+ * the entry that matters (see fd_aka_from_imdb_releaseinfo()).
+ *
+ * @return array<int,array{text:string,country:string}>
+ */
+function fd_parse_imdb_aka_markdown(string $text): array
+{
+    $pos = stripos($text, 'Also known as');
+    if ($pos === false) {
+        return [];
+    }
+    $section = substr($text, $pos);
+    // Stop at the next markdown heading ("## [Contribute to this page](…)").
+    if (preg_match('/\n#{1,6}\s/', substr($section, 1), $m, PREG_OFFSET_CAPTURE)) {
+        $section = substr($section, 0, $m[0][1] + 1);
+    }
+
+    $akas = [];
+    $group = '';
+    foreach (preg_split('/\r?\n/', $section) ?: [] as $line) {
+        if (!preg_match('/^(\s*)\*\s+(.+?)\s*$/u', $line, $m)) {
+            continue;
+        }
+        $value = trim($m[2]);
+        if ($value === '' || str_starts_with($value, '[')) {
+            continue; // links, e.g. "Contribute to this page"
+        }
+        if (strlen($m[1]) >= 2) {
+            $akas[] = ['text' => $value, 'country' => $group];
+        } else {
+            $group = $value;
+        }
+    }
+    return $akas;
+}
+
+/**
+ * Pick the best alternate title out of an AKA list: the `(original title)` entry when it
+ * is there (that is the name catalogue files are published under), else the first alias.
+ *
+ * @return array{originaltitle:string,aka:string}
+ */
+function fd_pick_imdb_aka(array $akas): array
+{
+    $original = '';
+    $first = '';
+    foreach ($akas as $row) {
+        $text = trim((string) ($row['text'] ?? ''));
+        if ($text === '') {
+            continue;
+        }
+        if ($first === '') {
+            $first = $text;
+        }
+        $country = strtolower(trim((string) ($row['country'] ?? '')));
+        if ($original === '' && ($country === '(original title)' || $country === 'original title')) {
+            $original = $text;
+        }
+    }
+    return [
+        'originaltitle' => $original,
+        'aka'           => $original !== '' ? $original : $first,
+    ];
+}
+
+/**
+ * r.jina.ai API key (optional).
+ *
+ * Anonymous calls are rate-limited to a handful of requests per minute and answer **429**
+ * to shared datacenter egress — the exact response our Cloudflare Worker got until it was
+ * given a key (`wrangler secret put JINA_API_KEY`). Resolution order: the
+ * `FD_JINA_API_KEY` env var, then `storage/jina_api_key.txt`. Without a key the
+ * release-info fetch still works from a residential IP (measured 200), so this is
+ * optional.
+ */
+function fd_jina_api_key(): string
+{
+    static $key = null;
+    if ($key !== null) {
+        return $key;
+    }
+    $fromEnv = trim((string) fd_env('FD_JINA_API_KEY', ''));
+    if ($fromEnv !== '') {
+        return $key = $fromEnv;
+    }
+    $file = fd_storage_path('storage/jina_api_key.txt');
+    if (is_file($file)) {
+        $read = trim((string) @file_get_contents($file));
+        if ($read !== '') {
+            return $key = $read;
+        }
+    }
+    return $key = '';
+}
+
+/**
+ * Alternate titles from IMDb's own release-info page ("Also known as").
+ *
+ * Why this exists: the upstream metas we fan out to carry the RELEASE title
+ * ("Superstition") and, at best, a truncated first word of the original title quoted in
+ * the description ("Khurafat"). IMDb's release-info page carries the full list, including
+ * the `(original title)` entry — for tt1801064 that is `Khurafat: Perjanjian Syaitan`,
+ * i.e. exactly the name the catalogue files use (`Khurafat.Perjanjian.Syaitan.2011…`).
+ *
+ * Two sources, in order:
+ *   1. our IMDb worker (`FD_IMDB_AKA_API_BASE/title/{id}/akas`) — fast, no proxy;
+ *   2. the same page rendered as markdown by `r.jina.ai`, fetched BY THIS PROCESS.
+ *      Measured from a Cloudflare Worker (source 1) `r.jina.ai` answers **429** while a
+ *      residential/VPS IP gets **200** with the AKA list intact, so this fetch has to
+ *      happen on the caller's egress, not a datacenter's.
+ *      IMDb itself is unusable directly: datacenter IPs get `202` with a 0-byte body from
+ *      `/title/{id}/releaseinfo/` and `403` from api.graphql.imdb.com.
+ *
+ * A hit is cached 7d in `imdb_aka_<md5>.json`; a miss is cached 1h — the probe runs
+ * whenever a title's primary name matched no files, which is often. The caller writes the
+ * result back into media_ids_idx, so later requests read it from the row for free.
+ *
+ * @return array{aka:string,originaltitle:string,title:string,akas:array,source:string}
+ */
+function fd_aka_from_imdb_releaseinfo(string $imdbId, string $hintTitle = '', string $hintYear = ''): array
+{
+    $empty = ['aka' => '', 'originaltitle' => '', 'title' => '', 'akas' => [], 'source' => '', 'persisted' => false];
+    $imdbId = trim($imdbId);
+    if (!preg_match('/^tt\d{6,10}$/i', $imdbId)) {
+        return $empty;
+    }
+
+    $cacheFile = fd_cache_path('imdb_aka_' . md5(strtolower($imdbId)) . '.json');
+    if (is_file($cacheFile)) {
+        $age = time() - (int) @filemtime($cacheFile);
+        $cached = json_decode((string) @file_get_contents($cacheFile), true);
+        if (is_array($cached)) {
+            if (!empty($cached['aka']) && $age < FD_SUBTITLE_ID_CACHE_TTL) {
+                return $cached + $empty;
+            }
+            if (empty($cached['aka']) && !empty($cached['probe']) && $age < 3600) {
+                return $empty;
+            }
+        }
+    }
+
+    $found = $empty;
+
+    // 1. Our IMDb worker. It tries the page and the proxy itself, so a 200 means one of
+    //    them worked on that egress; a 502 means both failed there (measured: 429).
+    if (FD_IMDB_AKA_API_BASE !== '') {
+        // `title`/`year` are HINTS: the API writes the resolved identity into
+        // media_ids_idx itself (it holds the WordPress secret), and it needs the year for
+        // that row — a write with year 0 would break the ±1-year file matcher. Passing them
+        // is what lets this backend stop POSTing /media-ids just to store an aka.
+        $akaUrl = rtrim(FD_IMDB_AKA_API_BASE, '/') . '/title/' . rawurlencode($imdbId) . '/akas';
+        $akaQuery = array_filter([
+            'title' => trim($hintTitle),
+            'year'  => trim($hintYear),
+        ], static fn($v) => $v !== '');
+        if (!empty($akaQuery)) {
+            $akaUrl .= '?' . http_build_query($akaQuery);
+        }
+        $res = fd_http_json($akaUrl, [], 'GET', 8);
+        if (is_array($res) && empty($res['error'])) {
+            $akas = [];
+            foreach ((array) ($res['akas'] ?? []) as $row) {
+                $text = is_array($row) ? trim((string) ($row['text'] ?? '')) : trim((string) $row);
+                if ($text !== '') {
+                    $akas[] = ['text' => $text, 'country' => is_array($row) ? (string) ($row['country'] ?? '') : ''];
+                }
+            }
+            $picked = fd_pick_imdb_aka($akas);
+            $originalTitle = trim((string) ($res['originaltitle'] ?? ''));
+            $found = [
+                'aka'           => $originalTitle !== '' ? $originalTitle : $picked['aka'],
+                'originaltitle' => $originalTitle !== '' ? $originalTitle : $picked['originaltitle'],
+                'title'         => trim((string) ($res['title'] ?? '')),
+                'akas'          => $akas,
+                'source'        => 'imdb_api' . (!empty($res['_source']) ? ':' . $res['_source'] : ''),
+                // The API already wrote media_ids_idx for this id.
+                'persisted'     => !empty($res['persisted']),
+            ];
+        }
+    }
+
+    // 2. `/title/{id}` — its `originaltitle` is the film's own title, and the API obtains it
+    //    through r.jina.ai with ITS OWN key, so this device needs no key at all. Only
+    //    reachable when the AKA list above came back empty. Measured on the VPS:
+    //    `{"_source":"html_jina","title":"Superstition","originaltitle":"Khurafat: Perjanjian Syaitan"}`
+    //    in 2.6 s (cached on the server for 30 min).
+    if ($found['aka'] === '') {
+        $res = fd_http_json(
+            rtrim(FD_IMDB_AKA_API_BASE, '/') . '/title/' . rawurlencode($imdbId),
+            [],
+            'GET',
+            12
+        );
+        if (is_array($res) && empty($res['error'])) {
+            $primary = trim((string) ($res['title'] ?? ''));
+            $original = trim((string) ($res['originaltitle'] ?? ''));
+            if ($original !== '' && strcasecmp($original, $primary) !== 0) {
+                $found = [
+                    'aka'           => $original,
+                    'originaltitle' => $original,
+                    'title'         => $primary,
+                    'akas'          => [],
+                    'source'        => 'imdb_api:' . (string) ($res['_source'] ?? 'title'),
+                ];
+            }
+        }
+    }
+
+    if ($found['aka'] === '') {
+        @file_put_contents(
+            $cacheFile,
+            json_encode(['aka' => '', 'probe' => time()], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
+            LOCK_EX
+        );
+        fd_log('imdb aka probe found none', ['imdb_id' => $imdbId]);
+        return $empty;
+    }
+
+    @file_put_contents(
+        $cacheFile,
+        json_encode($found, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
+        LOCK_EX
+    );
+    fd_log('imdb aka resolved', [
+        'imdb_id' => $imdbId,
+        'aka'     => $found['aka'],
+        'source'  => $found['source'],
+    ]);
+    return $found;
+}
+
+/**
+ * Alternate title (AKA) for an IMDb id, when media_ids_idx has none.
+ *
+ * Measured case: `tt1801064` is **"Superstition"** (2011, Malaysia) in TMDB/IMDb, but
+ * every Telegram file is named `Khurafat.Perjanjian.Syaitan.2011…` — the film's Malay
+ * title. The catalog row's `aka` is empty, so the AKA search never fired, the title
+ * search for "Superstition" only reached an unrelated **1982** film of the same name,
+ * and the title returned "No Streams Found".
+ *
+ * Sources, in order:
+ *   1. the upstream meta's `aka` / `originalTitle` fields;
+ *   2. a title QUOTED at the start of the upstream description — how TMDB-imported
+ *      Malaysian/Indonesian descriptions are written:
+ *      `"Khurafat" begins with Johan, a young man…` → `Khurafat`.
+ *
+ * A hit is stored in the `ext_meta_` cache and WRITTEN BACK into media_ids_idx under the
+ * same pseudo-post id, so every later request (and every other client) reads it from the
+ * row for free. An empty result is not cached beyond the request, so a title added later
+ * upstream is still picked up.
+ */
+function fd_aka_from_upstream(string $imdbId, string $type = 'movie', string $knownTitle = '', string $knownYear = ''): string
+{
+    $imdbId = trim($imdbId);
+    if (!preg_match('/^tt\d{6,10}$/i', $imdbId)) {
+        return '';
+    }
+    static $memory = [];
+    if (array_key_exists($imdbId, $memory)) {
+        return $memory[$imdbId];
+    }
+
+    $cacheFile = fd_cache_path('ext_meta_' . md5($imdbId) . '.json');
+    if (is_file($cacheFile)) {
+        $cached = json_decode((string) @file_get_contents($cacheFile), true);
+        if (is_array($cached) && !empty($cached['aka'])) {
+            return $memory[$imdbId] = (string) $cached['aka'];
+        }
+        // Negative cache. The probe runs whenever a movie's primary title matched no
+        // files, i.e. very often, so an upstream miss must not cost a network
+        // round-trip on every playback. 1h is short enough that a title added
+        // upstream later is still picked up.
+        //
+        // The `aka_probe` flag is REQUIRED. `ext_meta_<md5>.json` is ALSO written by the
+        // movie fast path (the `/stream-files` handler) and by
+        // fd_resolve_external_media_metadata(), both of which set `aka: ''` without ever
+        // asking upstream. Treating any empty `aka` as a negative result made the probe
+        // short-circuit on those files, so no alternate title was ever derived.
+        if (
+            is_array($cached) && !empty($cached['aka_probe']) && $cached['aka'] === ''
+            && (time() - (int) @filemtime($cacheFile)) < 3600
+        ) {
+            return $memory[$imdbId] = '';
+        }
+    }
+
+    $isSeries = (str_contains(strtolower($type), 'series') || str_contains(strtolower($type), 'tv'));
+    $resolvedType = $isSeries ? 'series' : 'movie';
+
+    // IMDb's own AKA list FIRST: it carries the FULL original title
+    // ("Khurafat: Perjanjian Syaitan" for tt1801064) where the upstream metas only quote
+    // a truncated first word ("Khurafat"). Sources/measurements live on
+    // fd_aka_from_imdb_releaseinfo(); the result is written back to media_ids_idx so the
+    // extra request happens once per title (7d cache).
+    // Hints let the API persist the row itself (see fd_aka_from_imdb_releaseinfo). The year
+    // must be REAL: the API refuses a write without one (a 0 would break the ±1-year file
+    // matcher), and when it refuses, this backend has to POST /media-ids itself — measured
+    // 7.45 s. Callers that know the year (the post row, the resolved meta) pass it in.
+    $hintYear = trim($knownYear);
+    if ($hintYear === '' && is_file($cacheFile)) {
+        $cachedMeta = json_decode((string) @file_get_contents($cacheFile), true);
+        if (is_array($cachedMeta)) {
+            $hintYear = (string) ($cachedMeta['year'] ?? '');
+        }
+    }
+    $imdbAka = fd_aka_from_imdb_releaseinfo($imdbId, $knownTitle, $hintYear);
+    if ($imdbAka['aka'] !== '' && strcasecmp($imdbAka['aka'], trim($knownTitle)) !== 0) {
+        // Keep whatever name/year the resolver already had for this id — only `aka` is new.
+        $previous = [];
+        if (is_file($cacheFile)) {
+            $decoded = json_decode((string) @file_get_contents($cacheFile), true);
+            if (is_array($decoded)) {
+                $previous = $decoded;
+            }
+        }
+        $name = (string) ($previous['name'] ?? '');
+        if ($name === '') {
+            $name = $imdbAka['title'];
+        }
+        $year = (string) ($previous['year'] ?? '');
+        @file_put_contents(
+            $cacheFile,
+            json_encode(
+                ['name' => $name, 'year' => $year, 'aka' => $imdbAka['aka']],
+                JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE
+            ),
+            LOCK_EX
+        );
+        // The API writes the row itself (it holds the WordPress secret) — so this backend
+        // POSTs only when the API could not, e.g. no secret configured. The write is a
+        // SYNCHRONOUS WordPress call (>1 s), so it is also never repeated for a value that
+        // has already been written.
+        if (empty($imdbAka['persisted'])) {
+            fd_persist_aka_for_imdb(
+                $imdbId,
+                $name !== '' ? $name : $knownTitle,
+                $year,
+                $imdbAka['aka'],
+                $resolvedType
+            );
+            $akaStore = fd_cache_path('imdb_aka_' . md5(strtolower($imdbId)) . '.json');
+            $storedAka = json_decode((string) @file_get_contents($akaStore), true);
+            if (!is_array($storedAka)) {
+                $storedAka = [];
+            }
+            $storedAka['persisted'] = $imdbAka['aka'];
+            @file_put_contents($akaStore, json_encode($storedAka, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+        }
+        fd_log('aka derived from imdb', [
+            'imdb_id' => $imdbId,
+            'aka'     => $imdbAka['aka'],
+            'source'  => $imdbAka['source'],
+        ]);
+        return $memory[$imdbId] = $imdbAka['aka'];
+    }
+
+    $metaUrls = [];
+    foreach (fd_get_upstream_resolver_manifests() as $idx => $upstream) {
+        $manifestUrl = trim((string) ($upstream['url'] ?? ''));
+        if ($manifestUrl === '') continue;
+        $base = preg_replace('#/manifest\.json(\?.*)?$#i', '', $manifestUrl);
+        $metaUrls['up_' . $idx] = rtrim($base, '/') . "/meta/{$resolvedType}/" . rawurlencode($imdbId) . '.json';
+    }
+    if (empty($metaUrls)) {
+        fd_log('aka probe: no upstream declares a meta resource', ['imdb_id' => $imdbId]);
+        return $memory[$imdbId] = '';
+    }
+    fd_log('aka probe start', ['imdb_id' => $imdbId, 'type' => $resolvedType, 'urls' => count($metaUrls)]);
+
+    $bodies = [];
+    $ampRes = fd_http_get_many_amp($metaUrls, ['timeout' => 4]);
+    if (!empty($ampRes['ok'])) {
+        foreach ($ampRes['results'] as $row) {
+            $bodies[] = (string) ($row['body'] ?? '');
+        }
+    }
+
+    $aka = '';
+    $title = '';
+    $year = '';
+    foreach ($bodies as $raw) {
+        if ($raw === '') continue;
+        $decoded = json_decode($raw, true);
+        $meta = $decoded['meta'] ?? null;
+        if (!is_array($meta)) continue;
+
+        foreach (['aka', 'originalTitle', 'original_title', 'alternativeTitle'] as $key) {
+            $value = $meta[$key] ?? '';
+            if (is_array($value)) {
+                $value = reset($value);
+            }
+            if (is_string($value) && trim($value) !== '') {
+                $aka = trim($value);
+                break;
+            }
+        }
+
+        if ($aka === '') {
+            $description = trim((string) ($meta['description'] ?? ''));
+            if ($description !== '' && preg_match('/^["“\'‘]([^"”\'’]{2,80})["”\'’]/u', $description, $dm)) {
+                $candidate = trim($dm[1]);
+                // Never treat the primary title itself as an alternate title.
+                if ($candidate !== '' && strcasecmp($candidate, (string) ($meta['name'] ?? '')) !== 0) {
+                    $aka = $candidate;
+                }
+            }
+        }
+
+        if ($aka !== '') {
+            $title = (string) ($meta['name'] ?? $knownTitle);
+            $relInfo = (string) ($meta['releaseInfo'] ?? ($meta['year'] ?? ''));
+            if (preg_match('/\b(19\d\d|20\d\d)\b/', $relInfo, $ym)) {
+                $year = $ym[1];
+            }
+            break;
+        }
+    }
+
+    if ($aka === '') {
+        // Remember the miss (see the negative-cache read above) so a title with no
+        // alternate name upstream is not re-probed on every playback. `aka_probe` is the
+        // marker that makes this a real negative result rather than an untouched cache.
+        @file_put_contents(
+            $cacheFile,
+            json_encode(['name' => '', 'year' => '', 'aka' => '', 'aka_probe' => time()], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
+            LOCK_EX
+        );
+        fd_log('aka probe found none', ['imdb_id' => $imdbId, 'upstreams' => count($metaUrls)]);
+        return $memory[$imdbId] = '';
+    }
+
+    @file_put_contents(
+        $cacheFile,
+        json_encode(['name' => $title, 'year' => $year, 'aka' => $aka], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
+        LOCK_EX
+    );
+    fd_persist_aka_for_imdb($imdbId, $title !== '' ? $title : $knownTitle, $year, $aka, $resolvedType);
+    fd_log('aka derived from upstream', ['imdb_id' => $imdbId, 'title' => $title, 'aka' => $aka]);
+
+    return $memory[$imdbId] = $aka;
+}
+
+/**
+ * Write an alternate title back into media_ids_idx under the id's pseudo-post row
+ * (`9000000000 + imdb`), synchronously — the same write path the subtitle resolver uses
+ * ([`fd_persist_imdb_id_for_post()`](backend.php)). `fd_media_ids_upsert()` must NOT be
+ * used here: it schedules the POST with `Amp\async()` and returns before it runs, so the
+ * write is dropped when the request ends.
+ */
+function fd_persist_aka_for_imdb(string $imdbId, string $title, string $year, string $aka, string $type = 'movie'): void
+{
+    if ($imdbId === '' || $aka === '' || !defined('FD_WP_API_BASE')) {
+        return;
+    }
+    $numeric = (int) preg_replace('/\D/', '', $imdbId);
+    $pseudoId = 9000000000 + ($numeric % 1000000000);
+
+    $res = fd_http_json(
+        FD_WP_API_BASE . '/media-ids',
+        [
+            'post_id'    => $pseudoId,
+            'media_ids'  => ['imdb' => $imdbId, 'tt' => $imdbId],
+            'title'      => $title !== '' ? $title : $imdbId,
+            'year'       => (int) $year,
+            'imdb_id'    => $imdbId,
+            'media_type' => (str_contains(strtolower($type), 'series') || str_contains(strtolower($type), 'tv')) ? 'tvseries' : 'movie',
+            'aka'        => $aka,
+        ],
+        'POST',
+        12
+    );
+    if (empty($res['ok'])) {
+        fd_log('aka persist failed', ['imdb_id' => $imdbId, 'aka' => $aka]);
+    }
 }
 
 /**
@@ -4646,6 +5487,141 @@ function fd_imdb_id_for_catalog_post(int $postId, string $type = 'movie'): strin
  * A hit is cached 7d, and when $catalogPostId is given it is also written back
  * into media_ids_idx under that post.
  */
+/**
+ * Title -> IMDb id through OUR OWN IMDb API (`{FD_IMDB_AKA_API_BASE}/search?query=…`).
+ *
+ * This takes the title->tt step in-house while AIOMetadata stays configured for the other
+ * media-info jobs it does (bridging meta/catalogs for other addons). Reasons:
+ *   * it answers titles the Manticore index has never seen — measured on the failing case
+ *     `lookup-id?prefix=imdb&title=Squid Game in Conversation 2025 • Movie` → **404 in 3.0 s**,
+ *     while `/search?query=Squid Game in Conversation` → `tt37455270`;
+ *   * one request to our own VPS (~1 s, 30 min cached there) instead of a third-party
+ *     catalog search;
+ *   * it also fills `media_ids_idx` when the caller persists the result.
+ *
+ * Scoring prefers an exact normalised title, then a ±1-year match, then a type match, so a
+ * remake or a same-named series does not win over the right entry.
+ *
+ * @return array{imdb_id:string,title:string,year:string,source:string}
+ */
+function fd_search_own_imdb_api_for_tt(string $title, string $year = '', string $type = 'movie'): array
+{
+    $empty = ['imdb_id' => '', 'title' => '', 'year' => '', 'source' => ''];
+    $title = trim($title);
+    if ($title === '' || FD_IMDB_AKA_API_BASE === '') {
+        return $empty;
+    }
+
+    // The API's search is literal: `"X 2025 • Movie"` finds nothing, `"X"` does.
+    $query = fd_strip_title_decorations($title);
+    if ($query === '') {
+        $query = $title;
+    }
+
+    $cacheFile = fd_cache_path('own_search_' . md5(strtolower($query . '|' . $year . '|' . $type)) . '.json');
+    if (is_file($cacheFile) && (time() - (int) @filemtime($cacheFile)) < FD_SUBTITLE_ID_CACHE_TTL) {
+        $cached = json_decode((string) @file_get_contents($cacheFile), true);
+        if (is_array($cached)) {
+            return $cached + $empty;
+        }
+    }
+
+    // IMDb's suggestion index is PREFIX-based: it answers "Squid Game" (4 hits) but returns
+    // **0** for the exact "Squid Game in Conversation", while `/title/tt37455270` IS that
+    // exact title (measured). So progressively shorter PREFIXES of the query are tried — and a
+    // hit from a SHORTENED query is accepted ONLY on an exact normalised title match. Without
+    // that rule the resolver would hand out the series "Squid Game" (2021) for a 2025 movie,
+    // which is worse than returning nothing and letting the upstream fallback resolve it.
+    $candidates = [$query];
+    $words = preg_split('/\s+/', $query) ?: [];
+    for ($take = count($words) - 1; $take >= 3; $take--) {
+        $candidates[] = implode(' ', array_slice($words, 0, $take));
+    }
+
+    $wantSeries = (str_contains(strtolower($type), 'series') || str_contains(strtolower($type), 'tv'));
+    $queryNorm  = fd_norm_title_for_match($query);
+
+    $best = $empty;
+    $bestScore = -1;
+    $lastCount = 0;
+    foreach ($candidates as $candidateQuery) {
+        $res = fd_http_json(
+            rtrim(FD_IMDB_AKA_API_BASE, '/') . '/search?' . http_build_query(['query' => $candidateQuery]),
+            [],
+            'GET',
+            10
+        );
+        $results = [];
+        if (is_array($res)) {
+            foreach (['results', 'metas', 'titles'] as $key) {
+                if (!empty($res[$key]) && is_array($res[$key])) {
+                    $results = $res[$key];
+                    break;
+                }
+            }
+        }
+        $lastCount = count($results);
+        if ($lastCount === 0) {
+            continue;
+        }
+        $shortened = ($candidateQuery !== $query);
+
+        foreach ($results as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+            $id = trim((string) ($row['id'] ?? ''));
+            if ($id === '' || !preg_match('/^tt\d{6,10}$/i', $id)) {
+                continue;
+            }
+            $rowTitle = trim((string) ($row['title'] ?? ($row['name'] ?? '')));
+            $rowNorm  = fd_norm_title_for_match($rowTitle);
+            // A shortened query may only claim an EXACT match (see the note above).
+            if ($shortened && ($rowNorm === '' || $rowNorm !== $queryNorm)) {
+                continue;
+            }
+            $rowYear = (string) ($row['year'] ?? '');
+            $rowType = strtolower((string) ($row['type'] ?? ($row['qid'] ?? '')));
+
+            $score = 0;
+            if ($rowNorm !== '' && $rowNorm === $queryNorm) {
+                $score += 10;
+            } elseif ($rowNorm !== '' && $queryNorm !== '' && str_contains($rowNorm, $queryNorm)) {
+                $score += 4;
+            }
+            if ($year !== '' && $rowYear !== '' && abs((int) $rowYear - (int) $year) <= 1) {
+                $score += 6;
+            }
+            $rowIsSeries = str_contains($rowType, 'series') || str_contains($rowType, 'tv');
+            if ($rowIsSeries === $wantSeries) {
+                $score += 3;
+            }
+            if ($score > $bestScore) {
+                $bestScore = $score;
+                $best = [
+                    'imdb_id' => $id,
+                    'title'   => $rowTitle,
+                    'year'    => $rowYear,
+                    'source'  => 'own_imdb_api',
+                ];
+            }
+        }
+
+        // Stop as soon as a candidate produced an exact-title hit.
+        if ($bestScore >= 10) {
+            break;
+        }
+    }
+    if ($best['imdb_id'] === '') {
+        fd_log('own imdb search found nothing', ['query' => $query, 'year' => $year, 'results' => $lastCount]);
+        return $empty;
+    }
+
+    @file_put_contents($cacheFile, json_encode($best, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+    fd_log('own imdb search resolved', ['query' => $query, 'imdb_id' => $best['imdb_id'], 'year' => $best['year']]);
+    return $best;
+}
+
 function fd_find_imdb_id_for_title(string $rawTitle, string $itemType = '', int $catalogPostId = 0): string
 {
     $rawTitle = trim($rawTitle);
@@ -4670,18 +5646,39 @@ function fd_find_imdb_id_for_title(string $rawTitle, string $itemType = '', int 
         $year = $ym[1];
     }
     $clean = trim((string) preg_replace('/[._\-]+/', ' ', $clean));
+    // Strip decorations BEFORE the lookup. Our own catalogue row titles carry them —
+    // "Veil of Shadows 2026 • TvSeries" — and this lookup is a literal phrase match against
+    // media_ids_idx, so the `•`, the year and the trailing `TvSeries` make it miss every time.
+    // Live log: `lookup-id?prefix=imdb&title=Veil+of+Shadows+2026+%E2%80%A2+TvSeries&year=2026`.
+    // The `$year` above is captured from the pre-strip string on purpose, since this removes it.
+    $clean = fd_strip_title_decorations($clean);
     if ($clean === '') {
         return '';
     }
 
     $type = (str_contains(strtolower($itemType), 'series') || str_contains(strtolower($itemType), 'tv')) ? 'series' : 'movie';
 
-    $cacheFile = fd_storage_path('storage/title_imdb_' . md5(strtolower($clean . '|' . $year . '|' . $type)) . '.txt');
+    $cacheKey  = md5(strtolower($clean . '|' . $year . '|' . $type));
+    $cacheFile = fd_storage_path('storage/title_imdb_' . $cacheKey . '.txt');
     if (is_file($cacheFile) && (time() - (int) @filemtime($cacheFile)) < FD_SUBTITLE_ID_CACHE_TTL) {
         $cached = trim((string) @file_get_contents($cacheFile));
         if ($cached !== '') {
             return $cached;
         }
+    }
+
+    // NEGATIVE cache. Only a SUCCESSFUL resolution used to be cached, so a title with no IMDb entry
+    // re-ran the whole chain on every single call: `lookup-id?prefix=imdb` (measured 2.685 s, 404) +
+    // our own IMDb API search (0.66-3.97 s, sometimes twice) + the upstream catalog search
+    // (0.272 s) = 4-7 s of wasted origin time PER EPISODE REQUEST. That traffic also competes with
+    // the `stream-files` call for the same event loop — live log: `stream-files?episode=5` was
+    // cancelled while an `imdb-api/search` for the same unresolvable title was running.
+    // The Android app already does this (its `subtitleResolveMiss`, 600 s TTL), which is a large
+    // part of why it feels instant. 600 s matching the app: long enough to stop the repeat, short
+    // enough that a title which appears in the index later is still picked up.
+    $missFile = fd_storage_path('storage/title_imdb_miss_' . $cacheKey . '.txt');
+    if (is_file($missFile) && (time() - (int) @filemtime($missFile)) < 600) {
+        return '';
     }
 
     $imdbId         = '';
@@ -4698,7 +5695,21 @@ function fd_find_imdb_id_for_title(string $rawTitle, string $itemType = '', int 
         }
     }
 
-    // 2. Searchable catalog of a configured upstream manifest.
+    // 2. OUR OWN IMDb API search — see fd_search_own_imdb_api_for_tt(). Replaces the
+    //    third-party catalog search for this step; AIOMetadata remains configured for the
+    //    other media-info work it does.
+    if ($imdbId === '') {
+        $ownHit = fd_search_own_imdb_api_for_tt($clean, $year, $type);
+        if (!empty($ownHit['imdb_id'])) {
+            $imdbId         = (string) $ownHit['imdb_id'];
+            $canonicalTitle = (string) ($ownHit['title'] ?? '');
+            if (!empty($ownHit['year'])) {
+                $canonicalYear = (string) $ownHit['year'];
+            }
+        }
+    }
+
+    // 3. Last resort: the searchable catalog of a configured upstream manifest.
     if ($imdbId === '') {
         $upHit = fd_search_upstream_for_imdb($clean, $year, $type);
         if (!empty($upHit['imdb_id'])) {
@@ -4711,8 +5722,13 @@ function fd_find_imdb_id_for_title(string $rawTitle, string $itemType = '', int 
     }
 
     if ($imdbId === '') {
-        fd_log('subtitle id unresolved', ['title' => $clean, 'year' => $year, 'type' => $type]);
+        @touch($missFile);
+        fd_log('subtitle id unresolved (negative-cached 600s)', ['title' => $clean, 'year' => $year, 'type' => $type]);
         return '';
+    }
+    // Resolved: drop any negative marker so a previously-unresolvable title resolves promptly now.
+    if (is_file($missFile)) {
+        @unlink($missFile);
     }
 
     @file_put_contents($cacheFile, $imdbId, LOCK_EX);
@@ -7163,6 +8179,37 @@ function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, s
             return true;
         }
 
+        // The catalogue title can END with a type word that the ORIGIN's keyword cleaner
+        // strips, while the FILE keeps it. Measured: `pm:post:8591885201` is
+        // "The Super Mario Galaxy MOVIE" (2026) and `stream-files?id=post:…` answers
+        // `resolved_title = "The Super Mario Galaxy"` with 112 items — every file named
+        // `…Galaxy.Movie.2026…` failed the equality above, only the one file named
+        // `…Galaxy.2026.480p.tracemedia11.mkv` matched, and the route returned **1** stream
+        // instead of the 101 the same items produce for the tt id. The year guard (step 1) has
+        // already run, so a same-year file whose cleaned title is the target PLUS a type word
+        // is that film. The type word must be the ONLY extra word.
+        if (
+            str_starts_with($baseF, $targetLower . ' ')
+            && preg_match('/^(?:movie|film|the\s+movie|tv\s*series|series|show)$/', substr($baseF, strlen($targetLower) + 1))
+        ) {
+            return true;
+        }
+
+        // AKA as a title PREFIX carrying a subtitle/descriptor that the upstream meta
+        // does not have. Measured: tt1801064 is "Superstition" (2011, Malaysia), the
+        // derived alternate title is "Khurafat", and EVERY catalogue file is named
+        // `Khurafat.Perjanjian.Syaitan.2011…` — the file's title equals the AKA only
+        // up to the subtitle ("Perjanjian Syaitan"), which no upstream source carries,
+        // so the strict equality above never matched and the film reported
+        // "No Streams Found". The year guard in step 1 has already run, so a same-year
+        // file whose cleaned name STARTS WITH the alternate title is that film.
+        if ($akaLower !== '' && strlen($akaLower) >= 4 && str_starts_with($baseF, $akaLower . ' ')) {
+            return true;
+        }
+        if ($noAposAkaLower !== '' && strlen($noAposAkaLower) >= 4 && str_starts_with($baseF, $noAposAkaLower . ' ')) {
+            return true;
+        }
+
         // Check if baseF ends with targetLower preceded by known uploader/channel/site words
         // e.g. "sklink office baththa" ends with "baththa", prefix is "sklink office"
         $targetsToCheck = [$targetLower];
@@ -7310,8 +8357,22 @@ function fd_series_file_matches_title(string $fileTitle, string $seriesTitle, in
     $contentWords = array_values(array_filter(explode(' ', $targetLower), fn($w) => !in_array($w, $stopWords, true)));
     $isSingleWord = count($contentWords) <= 1;
 
-    // 3. Strict Year check if year is specified on the series and present on the file
-    $hasFileYear = (bool) preg_match('/\b(19\d\d|20\d\d)\b/', $fileTitle, $fym);
+    // 3. Strict Year check if year is specified on the series and present on the file.
+    //
+    // The CAPTION frequently holds the full release name — and with it the year the file name
+    // omits: `One.Piece.2023.Season.1.S01.E01.E04.COMBINED.1080p.mkv` carries no year, while its
+    // caption reads "One Piece (2023) Season 1 S01 [E01-E04] COMBINED 1080p 10bit NF WEBRip …".
+    // Measured: that file was listed under the **1999** anime entry
+    // (`pm:post:8798795472:1:1`). Only used when the NAME has no year, so it can never override
+    // a real file year.
+    $yearSource = $fileTitle;
+    if ($fileCaption !== '' && !preg_match('/\b(19\d\d|20\d\d)\b/', $fileTitle)) {
+        $capFirstLine = trim((string) strtok($fileCaption, "\r\n"));
+        if ($capFirstLine !== '') {
+            $yearSource = $fileTitle . ' ' . $capFirstLine;
+        }
+    }
+    $hasFileYear = (bool) preg_match('/\b(19\d\d|20\d\d)\b/', $yearSource, $fym);
     if ($seriesYear !== '' && $hasFileYear) {
         $fileYear = (int) $fym[1];
         $targetYear = (int) $seriesYear;
@@ -7382,6 +8443,30 @@ function fd_series_file_matches_title(string $fileTitle, string $seriesTitle, in
     // Regression test: test_kudrat_series.php (the "MUST NOT REGRESS" cases).
     if (!$hasFileYear && $seriesYear !== '' && $isSingleWord && !$hasLeadingThe) {
         if (preg_match('/\b(netflix|\bnf\b|k\.o|korean|korea|rarbg|kdg)\b/i', $fileTitle . ' ' . $fileCaption)) {
+            return false;
+        }
+    }
+
+    // 5c. A file that declares a DIFFERENT KIND of release than the entry is a different work.
+    //
+    // Opening `pm:post:8798795472:1:1` ("One Piece" 1999) listed **LEGO One Piece** (13 files),
+    // **One Piece MOVIE / OVA / TV-SP / LOG / Film** files (51) and the 2023 live-action's
+    // `IAC…One.Piece.Live.Action…` — none of them this show. The entry's own title is the
+    // discriminator: a marker the entry title does NOT carry means the file belongs to a sibling
+    // work, which is exactly right for the entries that ARE that work — "One Piece Log: Fish-Man
+    // Island Saga" carries `log`, "One Piece Film: Strong World" carries `film`, and any
+    // "ONE PIECE live-action" entry carries `live action`, so every one of them keeps its own
+    // files. A marker the entry title DOES carry is ignored, so the rule can never reject a file
+    // merely for being named like the entry.
+    $entryNorm = strtolower(trim(preg_replace('/\s+/', ' ', preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $seriesTitle))));
+    if ($entryNorm !== '' && ($fCleanNorm !== '' || $afterEp !== '')) {
+        $fileRegion = trim($fCleanNorm . ' ' . $afterEp);
+        foreach (['movie', 'film', 'ova', 'oav', 'oad', 'ona', 'special', 'recap', 'log', 'lego'] as $kindMarker) {
+            if (preg_match('/\b' . $kindMarker . '\b/', $fileRegion) && !preg_match('/\b' . $kindMarker . '\b/', $entryNorm)) {
+                return false;
+            }
+        }
+        if (preg_match('/\btv\s*sp\b|live[ ._-]?action/', $fileRegion) && !preg_match('/live[ ._-]?action/', $entryNorm)) {
             return false;
         }
     }
@@ -8028,6 +9113,15 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
     if (preg_match('/\b(19\d\d|20\d\d)\b/', $fullTitle, $ym)) {
         $postYear = $ym[1];
     }
+    // The row's own `year` column is authoritative and is often the ONLY place the year lives.
+    // `fd_resolve_external_media_metadata('tt0388629')` answers title "One Piece" + year "1999" —
+    // and reading the TITLE alone left `$postYear` null, so the ±1-year guard in
+    // fd_series_file_matches_title() never ran and the One Piece ANIME's IMDb id listed **41**
+    // files of the 2023 live-action (`ONE.PIECE.2023.S01E01.ROMANCE.DAWN…`). The same id via
+    // `pm:post:` was already clean because that path derived the year from the post's own files.
+    if ($postYear === null && !empty($post['year']) && preg_match('/^(?:19\d\d|20\d\d)$/', (string) $post['year'])) {
+        $postYear = (string) $post['year'];
+    }
 
     $filter = fd_episode_stream_filter($season, $episode);
     $all = [];
@@ -8060,6 +9154,74 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
         }
     };
 
+    // 0. THE POST'S OWN FILE SET FIRST — one fetch serves every episode (Android parity).
+    //
+    // The per-episode `stream-files?season=…&episode=…` call below is a DISTINCT origin URL for
+    // every episode, so EVERY episode starts cold: measured on `pm:post:9000007036`, E1 answered in
+    // 1.5 s while E2 burned its full 15 s budget, was cancelled, and only the retry succeeded —
+    // 18.5 s for one episode. The Android app instead fetches the post's files ONCE and matches
+    // episodes locally (measured there: E1 0.388 s, E2 0.322 s), which is the structural reason the
+    // phone feels instant after S1E1.
+    //
+    // `fd_fetch_post_files_paged()` goes through the cache-first `fd_fetch_stream_ajax()`, and with
+    // NO `season`/`episode` in the query its URL is the SAME for every episode — so E2..EN are
+    // served from disk instead of the origin. Matching is unchanged: the same `$add()` closure
+    // decides, via fd_episode_stream_filter() + fd_series_file_matches_title().
+    //
+    // Only the first episode of a title pays this (larger) fetch, and the per-episode Manticore
+    // call below stays as the fallback whenever this yields nothing — so nothing can regress into
+    // "No Streams Found"; it can only become faster, or fall through to exactly today's behaviour.
+    if ($postId > 0 && count($all) === 0) {
+        $postFiles = fd_fetch_post_files_paged($postId, [
+            'page_size' => 200,
+            'max_files' => 600,
+            'max_pages' => 3,
+        ]);
+        if (!empty($postFiles)) {
+            // Derive the ENTRY YEAR from the post's own file set when the title carries none.
+            //
+            // `lookup-id?prefix=post&id=8798795472` answers with the title "One Piece" and nothing
+            // else, yet all **600** of that post's own files are named `One.Piece.1999.<episode>`.
+            // Without a year the ±1-year guard in fd_series_file_matches_title() is inert, so the
+            // 2023 live-action's and the 2026 remake's Episode-1 files were accepted under the
+            // 1999 anime — the reported mixing. Only derived when the title has NO year at all
+            // (so a show whose NAME embeds one, like "Kudrat 1968", is never re-dated) and only
+            // from a clear majority of the post's own files.
+            if ($postYear === null) {
+                $yearCounts = [];
+                foreach ($postFiles as $pf) {
+                    if (preg_match('/\b(19\d\d|20\d\d)\b/', (string) ($pf['title'] ?? ''), $pym)) {
+                        $yearCounts[$pym[1]] = ($yearCounts[$pym[1]] ?? 0) + 1;
+                    }
+                }
+                if (!empty($yearCounts)) {
+                    arsort($yearCounts);
+                    $topYear = (string) array_key_first($yearCounts);
+                    $tagged = array_sum($yearCounts);
+                    if ((int) $topYear >= 1950 && $yearCounts[$topYear] >= 20 && $yearCounts[$topYear] >= 0.6 * $tagged) {
+                        $postYear = $topYear;
+                        fd_log('series year derived from post set', [
+                            'postId' => $postId,
+                            'year'   => $topYear,
+                            'tagged' => $tagged,
+                            'total'  => count($postFiles),
+                        ]);
+                    }
+                }
+            }
+
+            $add($postFiles);
+            fd_log('episode files from cached post set', [
+                'postId'        => $postId,
+                'season'        => $season,
+                'episode'       => $episode,
+                'postFiles'     => count($postFiles),
+                'matched'       => count($all),
+                'duration_seconds' => round(microtime(true) - $tStart, 3),
+            ]);
+        }
+    }
+
     // 1. Fast path: Server-side native Manticore stream resolution in 1 single round-trip (~0.3s)
     // NOTE: $fastPathDone MUST be set whenever Manticore responds (isset($res['ok'])).
     // If Manticore confirms 0 items match, we immediately return instead of triggering
@@ -8067,12 +9229,14 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
     $fastPathDone = false;
     $idParam = trim((string) ($preloadedPost['id'] ?? ($preloadedPost['external_id'] ?? ($preloadedPost['imdb_id'] ?? ($postId > 0 ? "post:{$postId}" : '')))));
     $idParam = preg_replace('/:\d+:\d+$/', '', $idParam);
-    if ($keyword !== '' || $idParam !== '') {
+    if (count($all) === 0 && ($keyword !== '' || $idParam !== '')) {
         $apiBase = FD_WP_API_BASE;
         $url = "{$apiBase}/stream-files?type=series&season={$season}&episode={$episode}&limit={$maxFiles}"
             . ($keyword !== '' ? '&title=' . urlencode($keyword) : '')
             . ($idParam !== '' ? "&id=" . urlencode($idParam) : '');
-        $res = fd_http_json($url, [], 'GET', 15);
+        // Cache-first (see fd_cached_wp_json): this route does the heavy Manticore work for a whole
+        // series episode list, and it used to be fetched uncached on EVERY /stream request.
+        $res = fd_cached_wp_json($url, 15);
         if (isset($res['ok'])) {
             $fastPathDone = true;
             if (empty($fullTitle) && !empty($res['resolved_title'])) {
@@ -8090,7 +9254,16 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
                 }
                 if ($idParam !== '' && !str_starts_with($idParam, 'post:')) {
                     $cFile = fd_cache_path('ext_meta_' . md5($idParam) . '.json');
-                    @file_put_contents($cFile, json_encode(['name' => $fullTitle, 'year' => (string) ($postYear ?? ''), 'aka' => ''], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+                    // Keep an aka that was already resolved for this id — writing `aka: ''`
+                    // here is what made the AKA search re-run on every request.
+                    $prevAka = '';
+                    if (is_file($cFile)) {
+                        $prevMeta = json_decode((string) @file_get_contents($cFile), true);
+                        if (is_array($prevMeta)) {
+                            $prevAka = (string) ($prevMeta['aka'] ?? '');
+                        }
+                    }
+                    @file_put_contents($cFile, json_encode(['name' => $fullTitle, 'year' => (string) ($postYear ?? ''), 'aka' => $prevAka], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
                 }
             }
             if (!empty($res['items']) && is_array($res['items'])) {
@@ -9690,6 +10863,35 @@ function fd_tunnel_register_worker(string $tunnelUrl): array
     return $vpsRes;
 }
 
+/**
+ * Register (or clear) the tunnel URL with the relay WITHOUT blocking the request.
+ *
+ * `fd_tunnel_register_worker()` makes two sequential HTTPS calls — the Contabo VPS Redis
+ * endpoint (10 s timeout) and then the Cloudflare Worker relay (5 s timeout) — and measured
+ * **8.0-9.4 s** per call once the Amp client fell back to cURL (the measured log showed
+ * `tunnel/register` 8.0 s + `tunnel.pencarimovie.com/api/tunnel/register` 5.9 s, plus
+ * retries). It is called from `/api/tunnel/status` (which the dashboard polls every ~2 s),
+ * from the status watchdog, from `fd_tunnel_auto_restart()`, and from
+ * `POST /api/tunnel/enable` — and NONE of those responses depends on its result. Note this
+ * alone does not make the tunnel cheaper to poke: the 5-minute watchdog cooldown in
+ * fd_get_tunnel_status() is still what keeps a dead tunnel from restarting on every poll.
+ *
+ * The registration therefore runs in a detached CLI process
+ * (`backend.php tunnel-register <url>`). When no process can be spawned the blocking call is
+ * used instead, so a registration is never silently dropped.
+ */
+function fd_tunnel_register_worker_async(string $tunnelUrl): bool
+{
+    // '-' carries "clear the registration" through the `start "" /b` shell hop on Windows,
+    // where an empty quoted argv element is not preserved.
+    $arg = $tunnelUrl === '' ? '-' : $tunnelUrl;
+    if (fd_spawn_backend_cli(['tunnel-register', $arg])) {
+        return true;
+    }
+    fd_tunnel_register_worker($tunnelUrl);
+    return false;
+}
+
 function fd_load_tunnel_state(): array
 {
     $path = fd_tunnel_state_path();
@@ -10675,8 +11877,9 @@ function fd_tunnel_auto_restart(): bool
         $url = $live;
     }
 
-    // Re-register with the relay worker (new quick-tunnel URL).
-    fd_tunnel_register_worker($url);
+    // Re-register with the relay worker (new quick-tunnel URL) — detached, so a
+    // watchdog restart cannot add 8-9 s to whatever request triggered it.
+    fd_tunnel_register_worker_async($url);
 
     $state['enabled'] = true;
     $state['pid'] = $newPid;
@@ -10713,13 +11916,25 @@ function fd_get_tunnel_status(): array
         ($metricsPort > 0 && stripos((string) @fd_tunnel_local_http_get('http://127.0.0.1:' . $metricsPort . '/ready', 1), '"status":200') !== false);
 
     // Watchdog: if the state says enabled but cloudflared died, revive it.
+    //
+    // THE 5-MINUTE COOLDOWN IS REQUIRED. This function backs `/api/tunnel/status`, which the
+    // dashboard polls every ~2 s. With no guard, a dead tunnel made EVERY poll run a full
+    // restart + relay registration INLINE — measured 7.9 s and 9.5 s for two `tunnel/register`
+    // calls (plus two retries) per attempt — while occupying FrankenPHP workers and queueing
+    // the real requests: an otherwise ~1.5 s `pm:post:` stream list measured **12.2-37 s** in
+    // exactly that window. Five minutes still self-heals and is far longer than any poll storm.
     if (!$alive && !empty($state['enabled'])) {
-        fd_tunnel_auto_restart();
-        $state = fd_load_tunnel_state();
-        $pid = fd_tunnel_read_pid();
-        $metricsPort = (int) ($state['metrics_port'] ?? 0);
-        $alive = ($pid > 1 && fd_tunnel_pid_alive($pid, $metricsPort)) ||
-            ($metricsPort > 0 && stripos((string) @fd_tunnel_local_http_get('http://127.0.0.1:' . $metricsPort . '/ready', 1), '"status":200') !== false);
+        $restartStamp = fd_tunnel_dir() . '/.last_autorestart';
+        $lastRestart = is_file($restartStamp) ? (int) @filemtime($restartStamp) : 0;
+        if (time() - $lastRestart > 300) {
+            @touch($restartStamp);
+            fd_tunnel_auto_restart();
+            $state = fd_load_tunnel_state();
+            $pid = fd_tunnel_read_pid();
+            $metricsPort = (int) ($state['metrics_port'] ?? 0);
+            $alive = ($pid > 1 && fd_tunnel_pid_alive($pid, $metricsPort)) ||
+                ($metricsPort > 0 && stripos((string) @fd_tunnel_local_http_get('http://127.0.0.1:' . $metricsPort . '/ready', 1), '"status":200') !== false);
+        }
     }
 
     $tunnelToken = trim((string) ($state['tunnel_token'] ?? ''));
@@ -10785,8 +12000,10 @@ function fd_get_tunnel_status(): array
             }
             fd_save_tunnel_state($state);
 
-            // Ensure the new URL is immediately registered with VPS Redis / relay
-            fd_tunnel_register_worker($url);
+            // Ensure the new URL is immediately registered with VPS Redis / relay.
+            // DETACHED: this runs on every `/api/tunnel/status` poll, and the blocking
+            // form measured 8.0-9.4 s per call while occupying a FrankenPHP worker.
+            fd_tunnel_register_worker_async($url);
         }
     }
 
@@ -10817,8 +12034,8 @@ function fd_get_tunnel_status(): array
 
 function fd_disable_tunnel(): array
 {
-    // Invalidate registration on VPS Redis
-    @fd_tunnel_register_worker('');
+    // Invalidate registration on VPS Redis / relay (detached).
+    fd_tunnel_register_worker_async('');
     fd_tunnel_kill_leftovers();
     fd_clear_tunnel_state(true);
     return [
@@ -10941,8 +12158,9 @@ function fd_enable_tunnel(string $rawToken = ''): array
         $url = $live;
     }
 
-    // Register with the *.pencarimovie.com relay worker
-    fd_tunnel_register_worker($url);
+    // Register with the *.pencarimovie.com relay worker (detached — see
+    // fd_tunnel_register_worker_async())
+    fd_tunnel_register_worker_async($url);
 
     $subdomain = fd_tunnel_subdomain();
     $publicDomainUrl = 'https://' . $subdomain . '-tunnel.pencarimovie.com';
@@ -13421,6 +14639,11 @@ if ($isNuvioRoute) {
             'userAgent' => $_SERVER['HTTP_USER_AGENT'] ?? '',
         ]);
 
+        // Opening an info page is the earliest reliable signal that a Play follows, so warm that
+        // item's stream list NOW, in the background, while the user is still reading the page.
+        // Fire-and-forget: returns immediately, the work happens on another worker thread.
+        fd_prewarm_stream_list($itemType, $itemId);
+
         // Format 1: Direct tg_file_new (pm_file_SHORT_CODE, pm:file_SHORT_CODE, or pm:file:SHORT_CODE)
         if (str_starts_with($itemId, 'pm_file_') || str_starts_with($itemId, 'pm:file_') || str_starts_with($itemId, 'pm:file:')) {
             if (str_starts_with($itemId, 'pm_file_')) {
@@ -13864,9 +15087,19 @@ if ($isNuvioRoute) {
             (isset($_SERVER['HTTP_CACHE_CONTROL']) && str_contains(strtolower($_SERVER['HTTP_CACHE_CONTROL']), 'no-cache')) ||
             (isset($_SERVER['HTTP_PRAGMA']) && str_contains(strtolower($_SERVER['HTTP_PRAGMA']), 'no-cache'));
 
+        // NO next-episode prewarm here any more. It existed to hide the cost of the per-episode
+        // `stream-files?season=…&episode=…` origin call, which made E2+ cold (18.5 s measured). That
+        // cause is gone: fd_fetch_episode_stream_files() now reads the POST'S OWN file set, with no
+        // season/episode in the query, so E1 caches it and every later episode is matched locally —
+        // measured E2..E5 at 0.348-0.383 s with ZERO origin calls, and for other titles too
+        // (`postId 9000008457` episodes 12 and 13: 0.002 s). Warming the next episode would now be
+        // pure background work for no gain, and it also raced the user: on `pm:post:9000007036:1:4`
+        // the warm started 2 s before the Play and helped nothing.
+
         $streamCacheKey = md5($itemId . ':' . $itemType . ':' . $baseUrl . ':' . (fd_is_authenticated() ? 'auth' : 'anon'));
         $streamCacheFile = fd_cache_path('stream_cache_' . $streamCacheKey . '.json');
-        if (!$isRefresh && is_file($streamCacheFile) && (time() - (int)filemtime($streamCacheFile)) < 300) {
+        $streamCacheAge = is_file($streamCacheFile) ? (time() - (int) @filemtime($streamCacheFile)) : -1;
+        if (!$isRefresh && $streamCacheAge >= 0 && $streamCacheAge < 300) {
             $cachedJson = @file_get_contents($streamCacheFile);
             if ($cachedJson) {
                 $cachedData = json_decode($cachedJson, true);
@@ -13895,6 +15128,50 @@ if ($isNuvioRoute) {
                         @unlink($streamCacheFile);
                     }
                 }
+            }
+        } elseif (!$isRefresh && $streamCacheAge >= 300 && $streamCacheAge < 21600) {
+            // STALE-WHILE-REVALIDATE — the "instant navigate" path.
+            //
+            // A cache file between 300 s and 6 h old used to be DELETED so the request could
+            // re-resolve, which made the user wait out the whole resolution before anything
+            // rendered — measured 1.5-3.7 s for a normal title and 53 s for a title whose files
+            // cannot be found (the AKA/IMDb chain burns 10 s timeouts plus a sequential
+            // search -> post_files walk). The result was already correct and playable; it was
+            // simply thrown away. Now the last good list is served IMMEDIATELY and the refresh is
+            // handed to a DETACHED CLI worker (fd_spawn_backend_cli → the `stream-warm` action),
+            // so the next visit is served from a fresh cache instead of paying this cost again.
+            // The worker re-resolves through the local loopback route with force=1, so no new
+            // origin load is created and no resolution logic is duplicated here.
+            $cachedJson = @file_get_contents($streamCacheFile);
+            $cachedData = $cachedJson ? json_decode($cachedJson, true) : null;
+            $stalePlayable = false;
+            if (is_array($cachedData) && !empty($cachedData['streams']) && is_array($cachedData['streams'])) {
+                foreach ($cachedData['streams'] as $cs) {
+                    if (is_array($cs) && (!empty($cs['url']) || !empty($cs['infoHash']))) {
+                        $stalePlayable = true;
+                        break;
+                    }
+                }
+            }
+            if ($stalePlayable) {
+                $warmPort = (string) ($_SERVER['SERVER_PORT'] ?? '8088');
+                $warmUrl = 'http://127.0.0.1:' . $warmPort . '/stream/' . rawurlencode((string) $itemType)
+                    . '/' . rawurlencode((string) $itemId) . '.json?force=1';
+                // Fire-and-forget loopback instead of a detached CLI worker: the warm runs on a
+                // DIFFERENT FrankenPHP thread, so it survives this response, and it costs no PHP
+                // process. Same request the `stream-warm` worker made (that action still exists for
+                // manual use) — see fd_prewarm_stream_list() for why a process is not needed.
+                fd_http_fire_and_forget($warmUrl, [], 'GET');
+                fd_log('stremio stream served STALE + background refresh queued', [
+                    'itemId' => $itemId,
+                    'cacheAge' => $streamCacheAge,
+                    'streamCount' => count($cachedData['streams']),
+                    'duration_seconds' => round(microtime(true) - $streamStart, 4),
+                ]);
+                fd_stremio_json($cachedData, 200, 'max-age=60, public');
+            } else {
+                // Nothing playable to hand over: fall through to a real resolution.
+                @unlink($streamCacheFile);
             }
         } elseif ($isRefresh && is_file($streamCacheFile)) {
             // Client explicitly requested refresh/revalidate: purge existing cache file
@@ -13966,7 +15243,16 @@ if ($isNuvioRoute) {
         $hasAmp = function_exists('Amp\\async') && function_exists('Amp\\Future\\await');
 
         $subtitlesFuture = null;
-        if ($hasAmp && !str_starts_with($itemId, 'pm:post:') && !str_starts_with($itemId, 'pm_post_') && !str_starts_with($itemId, 'pm:file:') && !str_starts_with($itemId, 'pm_file_')) {
+        // EVERY id type, our own `pm:*` ones included. The previous version exempted pm ids,
+        // which sent them to the UNBOUNDED `fd_get_item_subtitles()` call below — measured on
+        // a phone for `pm:post:6987813596`: 3.825 s (`lookup-id?prefix=post`) + 2.883 s
+        // (`lookup-id?prefix=imdb&title=…`) of an 10.8 s stream list, spent resolving subtitles
+        // the stream list does not need to render. The client asks
+        // `/subtitles/{type}/{id}.json` separately — that route does the full, cached
+        // resolution (and the identity write) with no bound — so here a bounded await is
+        // enough: warm subtitles still ride along inline, cold ones never delay the play
+        // button.
+        if ($hasAmp) {
             $subtitlesFuture = \Amp\async(static function () use ($itemType, $itemId): array {
                 try {
                     return fd_get_item_subtitles($itemType, $itemId);
@@ -14099,67 +15385,119 @@ if ($isNuvioRoute) {
             $targetSeason = isset($pmMatches[2]) ? (int) $pmMatches[2] : null;
             $targetEpisode = isset($pmMatches[3]) ? (int) $pmMatches[3] : null;
 
+            // Initialized here (not only in the external-id branch below) because the movie
+            // path derives and consumes it, and `empty($searchedAka)` on an undefined
+            // variable would silently drop the alternate-title search.
+            $searchedAka = '';
+            // Filled by the lazy fallback below (one media_ids_idx read). The external-id
+            // branch reads it when present.
+            $postIdentity = [];
+            // Empty for a series: its title/year are resolved inside the episode fetch.
+            $postTitle = '';
+            $postYear = '';
+
             $isSeries = ($itemType === 'series' || str_contains(strtolower($itemType), 'series') || ($targetSeason !== null && $targetEpisode !== null));
             // Fast Path 1: Series episode requested via post ID (e.g. pm:post:9000020144:1:1 or series root pm:post:9000020144)
             if ($isSeries) {
                 $filesToStream = fd_fetch_episode_stream_files($postId, $targetSeason ?? 1, $targetEpisode ?? 1, 250);
             }
-            // Fast Path 2: Movie requested via post ID
+            // Fast Path 2: Movie requested via post ID — ONE origin call, then match. Everything
+            // else is the lazy fallback below, and that only runs when this matched nothing.
+            // Same shape as the Android app's pm:post branch (NativeHttpServer.kt).
             else {
-                $mUrl = FD_WP_API_BASE . "/stream-files?id=" . urlencode("post:{$postId}") . "&type=movie&limit=150";
-                $res = fd_http_json($mUrl, [], 'GET', 15);
+                // 8 s, NOT 15 s. `fd_http_get_contents()` retries a cancelled Amp attempt once,
+                // 150 ms later, and the origin answers that retry quickly once its own Manticore
+                // query / FastCGI cache is warm — measured on a phone: the 15 s attempt was
+                // cancelled and the retry answered 200 in 2.226 s, so 17.2 s of a 21 s stream
+                // list went into one call that was going to be retried anyway. 15 s was also the
+                // only bare-`fd_http_json()` call on this path.
+                // Cache-first (`fd_cached_wp_json`) — the heaviest origin call per movie, and it
+                // was uncached.
+                $res = fd_cached_wp_json(FD_WP_API_BASE . "/stream-files?id=" . urlencode("post:{$postId}") . "&type=movie&limit=150", 8);
                 $postTitle = (string) ($res['resolved_title'] ?? '');
                 $postYear = (string) ($res['resolved_year'] ?? '');
-                $searchedTitle = $postTitle;
-                $searchedYear = $postYear;
-                $moviePostFastPathDone = false;
-                if (isset($res['ok']) && !empty($res['items']) && is_array($res['items'])) {
-                    $moviePostFastPathDone = true;
-                    foreach ($res['items'] as $f) {
-                        $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
-                        $fCaption = (string) ($f['caption'] ?? '');
-                        // Strict title and year check to prevent unrelated files from leaking into movie streams
-                        if ($postTitle === '' || fd_movie_file_matches_title($fTitle, $postTitle, $postYear, '', $fCaption)) {
-                            $filesToStream[] = $f;
-                        }
+                // The year is written into the title for most of these posts ("Less of a
+                // Stranger 2026 • Movie"); asking the identity for it cost 3.48 s per list.
+                if ($postYear === '' && preg_match('/\b(19\d\d|20\d\d)\b/', $postTitle, $yearInTitle)) {
+                    $postYear = $yearInTitle[1];
+                }
+                foreach ((array) ($res['items'] ?? []) as $f) {
+                    $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
+                    $fCaption = (string) ($f['caption'] ?? '');
+                    // Strict title and year check to prevent unrelated files from leaking into movie streams
+                    if ($postTitle === '' || fd_movie_file_matches_title($fTitle, $postTitle, $postYear, '', $fCaption)) {
+                        $filesToStream[] = $f;
                     }
                 }
             }
 
-            // Fallback for Movie requested via post ID:
-            // If stream-files returned 0 items, probe post_files directly for this exact post ID
+            // LAZY FALLBACK. One media_ids_idx read serves all three needs — the title (a pseudo
+            // post id's `stream-files` row carries none, which is why the match above accepted its
+            // items unconditionally), the year and the aka. It is a SERIAL WordPress call (3.5 s
+            // measured for `lookup-id?prefix=post&id=16364`), so it is paid only on this path.
+            // Movie-only: the series path resolved its episodes above and must not pay for it.
             if (empty($filesToStream) && $postId > 0) {
+                if (!$isSeries) {
+                    $postIdentity = fd_lookup_catalog_post_identity($postId);
+                    if ($postTitle === '') $postTitle = (string) ($postIdentity['title'] ?? '');
+                    if ($postYear === '') $postYear = (string) ($postIdentity['year'] ?? '');
+                    $searchedAka = (string) ($postIdentity['aka'] ?? '');
+                }
+                // The post's OWN files. A real post id has them; a pseudo id has none and falls
+                // through to the title search below.
                 $pfRes = fd_fetch_stream_ajax('post_files', ['post_id' => $postId, 'limit' => 100]);
-                if (is_array($pfRes) && !empty($pfRes['files'])) {
-                    foreach ($pfRes['files'] as $f) {
-                        $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
-                        $fCaption = (string) ($f['caption'] ?? '');
-                        if ($postTitle === '' || fd_movie_file_matches_title($fTitle, $postTitle, $postYear ?? '', '', $fCaption)) {
-                            $filesToStream[] = $f;
-                        }
+                foreach ((array) ($pfRes['files'] ?? []) as $f) {
+                    $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
+                    $fCaption = (string) ($f['caption'] ?? '');
+                    if ($postTitle === '' || fd_movie_file_matches_title($fTitle, $postTitle, $postYear, $searchedAka, $fCaption)) {
+                        $filesToStream[] = $f;
                     }
                 }
             }
 
-            if (!$moviePostFastPathDone && empty($filesToStream) && !empty($postTitle)) {
+            if (empty($filesToStream) && !empty($postTitle)) {
                 $seenCodes = [];
-                $postYear = null;
+                // Year from the title when it is written there, otherwise KEEP the year we
+                // already resolved (the row's, or the title's). This used to be an
+                // unconditional `$postYear = null`, which silently disabled
+                // fd_movie_file_matches_title()'s year guard for every title without a year in
+                // its name.
                 if (preg_match('/\b(19\d\d|20\d\d)\b/', $postTitle, $ym)) {
                     $postYear = $ym[1];
                 }
-                $searchVariants = fd_build_search_query_variants($postTitle, $postYear ?? '');
+                $searchVariants = fd_build_search_query_variants($postTitle, $postYear);
+                // Files are very often named in the film's ORIGINAL-language title, which no
+                // upstream source carries verbatim (row title "Superstition" → derived aka
+                // "Khurafat.Perjanjian.Syaitan" → files "Khurafat.Perjanjian.Syaitan.2011…").
+                // Search both names; the row's aka is free, the derivation only costs when the
+                // row has none.
+                if ($searchedAka === '' && !empty($postIdentity['imdb_id'])) {
+                    // Synchronous and lazy, exactly like the Android app: this only runs when the
+                    // fast path AND the post_files probe both matched nothing, and with the aka
+                    // persisted into media_ids_idx on first resolution it usually is not reached
+                    // at all.
+                    $searchedAka = fd_aka_from_upstream((string) $postIdentity['imdb_id'], 'movie', $postTitle, $postYear);
+                }
+                if ($searchedAka !== '' && strcasecmp($searchedAka, $postTitle) !== 0) {
+                    foreach (fd_build_search_query_variants($searchedAka, $postYear) as $akaQuery) {
+                        if (!in_array($akaQuery, $searchVariants, true)) {
+                            $searchVariants[] = $akaQuery;
+                        }
+                    }
+                }
+                // ONE parallel round-trip instead of N sequential WordPress searches: measured
+                // 4.0 + 2.0 + 1.3 + 1.1 s for the four "Siccîn 9" variants — and all four
+                // returned the SAME 2,632 bytes. fd_search_files_parallel() answers with
+                // [query => files], so the ordering below (best variant first) is preserved.
+                $variantFiles = fd_search_files_parallel($searchVariants);
                 foreach ($searchVariants as $sv) {
-                    $sf = fd_fetch_stream_ajax('search_files', ['search' => $sv, 'limit' => 30]);
-                    if (is_array($sf) && !empty($sf['files'])) {
-                        foreach ($sf['files'] as $f) {
-                            if (empty($f['short_code']) || isset($seenCodes[$f['short_code']])) continue;
-                            $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
-                            $fCap = (string) ($f['caption'] ?? '');
-
-                            if (fd_movie_file_matches_title($fTitle, $postTitle, $postYear ?? '', '', $fCap)) {
-                                $seenCodes[$f['short_code']] = true;
-                                $filesToStream[] = $f;
-                            }
+                    foreach ((array) ($variantFiles[$sv] ?? []) as $f) {
+                        if (empty($f['short_code']) || isset($seenCodes[$f['short_code']])) continue;
+                        $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
+                        $fCap = (string) ($f['caption'] ?? '');
+                        if (fd_movie_file_matches_title($fTitle, $postTitle, $postYear, $searchedAka, $fCap)) {
+                            $seenCodes[$f['short_code']] = true;
+                            $filesToStream[] = $f;
                         }
                     }
                 }
@@ -14308,7 +15646,15 @@ if ($isNuvioRoute) {
                             }
                             if (!empty($res['resolved_title']) && $itemId !== '' && !str_starts_with($itemId, 'pm:')) {
                                 $cFile = fd_cache_path('ext_meta_' . md5($itemId) . '.json');
-                                @file_put_contents($cFile, json_encode(['name' => (string)$res['resolved_title'], 'year' => (string)($res['resolved_year'] ?? ''), 'aka' => ''], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+                                // Same rule as the other writers: never blank a resolved aka.
+                                $prevAka = '';
+                                if (is_file($cFile)) {
+                                    $prevMeta = json_decode((string) @file_get_contents($cFile), true);
+                                    if (is_array($prevMeta)) {
+                                        $prevAka = (string) ($prevMeta['aka'] ?? '');
+                                    }
+                                }
+                                @file_put_contents($cFile, json_encode(['name' => (string)$res['resolved_title'], 'year' => (string)($res['resolved_year'] ?? ''), 'aka' => $prevAka], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
                             }
                             if (!empty($res['items']) && is_array($res['items'])) {
                                 foreach ($res['items'] as $f) {
@@ -14319,6 +15665,42 @@ if ($isNuvioRoute) {
                                     }
                                 }
                             }
+                        }
+                    }
+
+                    // No AKA on the row? Derive one from the upstream meta BEFORE the probes
+                    // below so they can use it. This MUST also run when the fast path answered
+                    // `ok` with 0 items: measured, Manticore replies ok:1/items:[] for
+                    // "Superstition" (tt1801064) while every file is named
+                    // "Khurafat.Perjanjian.Syaitan.2011…", so the AKA probes are the only way
+                    // to reach them. The derived AKA is written back into media_ids_idx.
+                    // Only derive an AKA when we actually resolved SOMETHING about this id.
+                    //
+                    // When the best title we have is still the raw id (`tt1234567`), there is no
+                    // alternate title to discover and no file name to match it against — but the
+                    // chain still costs a measured 3.31 s (/title/{id}/akas) + 2.56 s
+                    // (/title/{id}) plus its own local work, and it was being handed the id itself
+                    // as the title/year hints (`?title=tt99999999&year=0`). Skipping it lets a bogus
+                    // or unknown id reach "No Streams Found" about 6 s sooner, while a genuine
+                    // foreign title (tt1801064 -> "Superstition" -> AKA "Khurafat") is unaffected
+                    // because its resolved title is NOT an id.
+                    $akaTitleResolved = ($primaryMovieTitle !== '' && !preg_match('/^tt\d{6,10}$/i', $primaryMovieTitle));
+                    if ($searchedAka === '' && empty($filesToStream) && $akaTitleResolved) {
+                        $akaImdb = '';
+                        if (preg_match('/^(tt\d{6,10})/i', $itemId, $aim)) {
+                            $akaImdb = $aim[1];
+                        } elseif ($imdbId !== '') {
+                            $akaImdb = $imdbId;
+                        } elseif (isset($postIdentity) && !empty($postIdentity['imdb_id'])) {
+                            $akaImdb = (string) $postIdentity['imdb_id'];
+                        }
+                        if ($akaImdb !== '') {
+                            $searchedAka = fd_aka_from_upstream(
+                                $akaImdb,
+                                ($itemType === 'series' || str_contains(strtolower($itemType), 'series')) ? 'series' : 'movie',
+                                $primaryMovieTitle !== '' ? $primaryMovieTitle : $searchedTitle,
+                                $searchedYear
+                            );
                         }
                     }
 
@@ -14365,15 +15747,21 @@ if ($isNuvioRoute) {
                         }
                     }
 
-                    // Fallback to query variants only if fast path failed / did not communicate
-                    if (!$movieFastPathDone && empty($filesToStream)) {
-                        $queriesToTry = fd_build_search_query_variants($primaryMovieTitle, $searchedYear);
+                    // Fallback to query variants. When the fast path answered `ok` (Manticore
+                    // confirmed the PRIMARY title has no files) the primary variants are
+                    // deliberately skipped — that is the slow 7-10s loop this guard exists to
+                    // prevent — but the AKA variants are still tried, because the alternate
+                    // title is a DIFFERENT string that Manticore has not been asked about.
+                    $akaDiffers = ($searchedAka !== '' && strcasecmp($searchedAka, $cleanMovieTitle) !== 0);
+                    if (empty($filesToStream) && (!$movieFastPathDone || $akaDiffers)) {
+                        $queriesToTry = $movieFastPathDone
+                            ? []
+                            : fd_build_search_query_variants($primaryMovieTitle, $searchedYear);
 
                         // Also try the AKA title. Catalog files may be named with
                         // either the primary title or the alternate one, so both are
-                        // searched. The AKA comes from the media_ids_idx row, so this
-                        // adds no network round-trip.
-                        if ($searchedAka !== '' && strcasecmp($searchedAka, $searchedTitle) !== 0) {
+                        // searched.
+                        if ($akaDiffers) {
                             foreach (fd_build_search_query_variants($searchedAka, $searchedYear) as $akaQuery) {
                                 if (!in_array($akaQuery, $queriesToTry, true)) {
                                     $queriesToTry[] = $akaQuery;
@@ -14381,9 +15769,56 @@ if ($isNuvioRoute) {
                             }
                         }
 
+                        // PROBE THE VARIANTS CONCURRENTLY, not one round trip per variant.
+                        //
+                        // This loop used to call fd_fetch_stream_ajax('search_files', …) once per
+                        // query, serially, so a movie that missed the fast path paid
+                        // variant1 + variant2 + … before anything could render — the same pattern
+                        // measured at 4.0 + 2.0 + 1.3 + 1.1 s for four "Siccîn 9" variants
+                        // (see the note on the sibling call at backend.php:15072). The queries are
+                        // mutually independent (they differ only in the title string), so they are
+                        // fanned out over ONE shared Amp client — same pooled connections and
+                        // Anycast resolver as the rest of the addon — and the results are then
+                        // consumed in the SAME order, so "best variant first" is preserved.
+                        // fd_search_files_parallel() falls back to the serial path when Amp is
+                        // unavailable, so behaviour is unchanged on hosts without it.
+                        // ONE ROUND TRIP INSTEAD OF N.
+                        //
+                        // The endpoint now ORs every variant into a single Manticore query itself
+                        // (the `titles` param in my-rest-api/main.php) and also extends its
+                        // post-filter to those titles, so the whole union can be asked for at once.
+                        // Measured on the live endpoint: `title=Siccîn 9` -> 0 items while
+                        // `title=Siccîn 9&titles=siccin` -> 221 real Siccîn files in ONE call; and
+                        // `title=Superstition&titles=Khurafat` -> 20 (the union with Khurafat's 18)
+                        // where `title=Superstition` alone returns 2. The per-variant loop below is
+                        // KEPT as the fallback for an endpoint that does not know `titles` yet
+                        // (then this call returns nothing and the loop answers instead).
+                        if (!empty($queriesToTry)) {
+                            $titlesParam = implode('|', array_slice(array_values(array_unique($queriesToTry)), 0, 12));
+                            $singleUrl = FD_WP_API_BASE . '/stream-files?type=movie&limit=150'
+                                . '&title=' . urlencode($primaryMovieTitle)
+                                . ($searchedYear !== '' ? '&year=' . urlencode($searchedYear) : '')
+                                . '&titles=' . urlencode($titlesParam);
+                            $singleRes = fd_http_json($singleUrl, [], 'GET', 20);
+                            if (isset($singleRes['ok']) && !empty($singleRes['items']) && is_array($singleRes['items'])) {
+                                foreach ($singleRes['items'] as $singleFile) {
+                                    $singleTitle = fd_clean_html_entities((string) ($singleFile['title'] ?? ''));
+                                    $singleCaption = (string) ($singleFile['caption'] ?? '');
+                                    if (fd_is_series_file($singleTitle, $singleCaption)) {
+                                        continue;
+                                    }
+                                    $filesToStream[] = $singleFile;
+                                }
+                                if (!empty($filesToStream)) {
+                                    $queriesToTry = [];
+                                }
+                            }
+                        }
+
+                        $variantFiles = fd_search_files_parallel($queriesToTry);
                         foreach ($queriesToTry as $mQuery) {
-                            $sf = fd_fetch_stream_ajax('search_files', ['search' => $mQuery, 'limit' => 30]);
-                            if (is_array($sf) && !empty($sf['files'])) {
+                            $sf = ['files' => (array) ($variantFiles[$mQuery] ?? [])];
+                            if (!empty($sf['files'])) {
                                 foreach ($sf['files'] as $f) {
                                     $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
                                     $fCaption = (string) ($f['caption'] ?? '');
@@ -17089,6 +18524,52 @@ if (PHP_SAPI === 'cli' || PHP_SAPI === 'phpdbg') {
         $codes = array_values(array_unique(array_filter(preg_split('/[\s,]+/', $rawCodes))));
         if (!empty($codes)) {
             fd_warmup_resolve_batch($codes, $cliBotId, 40, $cliContext);
+        }
+        exit(0);
+    }
+    if ($cliAction === 'tunnel-register') {
+        $cliUrl = (string) ($cliArgs[2] ?? '');
+        if ($cliUrl === '-') {
+            // '-' is the transport for "clear the registration" — see
+            // fd_tunnel_register_worker_async().
+            $cliUrl = '';
+        }
+        $regRes = fd_tunnel_register_worker($cliUrl);
+        fd_log('cli tunnel register finished', [
+            'url' => $cliUrl !== '' ? $cliUrl : '(cleared)',
+            'ok'  => !empty($regRes['ok']) ? 1 : 0,
+        ]);
+        exit(0);
+    }
+    if ($cliAction === 'media-ids-persist') {
+        $cliPostId = (int) ($cliArgs[2] ?? 0);
+        $cliImdbId = (string) ($cliArgs[3] ?? '');
+        $cliTitleRaw = base64_decode((string) ($cliArgs[4] ?? ''), true);
+        $cliTitle = is_string($cliTitleRaw) ? $cliTitleRaw : '';
+        $cliYear = (string) ($cliArgs[5] ?? '');
+        $cliType = (string) ($cliArgs[6] ?? 'movie');
+        $cliWritten = fd_media_ids_write($cliPostId, $cliImdbId, $cliTitle, $cliYear, $cliType);
+        fd_log('cli media-ids persist finished', [
+            'post_id' => $cliPostId,
+            'imdb_id' => $cliImdbId,
+            'written' => $cliWritten ? 1 : 0,
+        ]);
+        exit(0);
+    }
+    if ($cliAction === 'stream-warm') {
+        // Detached stale-while-revalidate worker: re-resolve ONE stream list so the next visit is
+        // served from a fresh stream_cache_ file. It calls the local loopback route with force=1
+        // (see the STALE-WHILE-REVALIDATE block in the /stream handler) rather than duplicating
+        // any resolution logic — one code path, warmed off the user's request.
+        $cliWarmUrl = (string) ($cliArgs[2] ?? '');
+        if ($cliWarmUrl !== '') {
+            $warmStart = microtime(true);
+            $warmBody = fd_http_get_contents($cliWarmUrl, ['timeout' => 120]);
+            fd_log('cli stream warm finished', [
+                'url' => $cliWarmUrl,
+                'bytes' => is_string($warmBody) ? strlen($warmBody) : 0,
+                'duration_seconds' => round(microtime(true) - $warmStart, 3),
+            ]);
         }
         exit(0);
     }
