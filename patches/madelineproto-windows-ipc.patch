@@ -362,87 +362,9 @@ index f28352f..855f5b7 100644
              $this->session->API->logger->logger("Zend hashmap reallocation done. Cleaned memory: $cleaned Mb", Logger::VERBOSE);
          }
 diff --git a/src/MTProtoTools/ReferenceDatabase.php b/src/MTProtoTools/ReferenceDatabase.php
-index e3c4904..dd78c3e 100644
 --- a/src/MTProtoTools/ReferenceDatabase.php
 +++ b/src/MTProtoTools/ReferenceDatabase.php
-@@ -109,7 +109,7 @@ final class ReferenceDatabase implements TLCallback
-     }
-     public function init(): void
-     {
--        $this->initDbProperties($this->API->getDbSettings(), $this->API->getDbPrefix().'_ReferenceDatabase_');
-+        $this->initDbProperties($this->API->getDbSettings(), $this->API->getDbPrefix() . '_ReferenceDatabase_');
-         if ($this->v === 0) {
-             $this->db->clear();
-             $this->pendingDb = [];
-@@ -190,11 +190,11 @@ final class ReferenceDatabase implements TLCallback
-     public function reset(): void
-     {
-         if ($this->cache) {
--            $this->API->logger('Found '.\count($this->cache).' pending contexts', Logger::ERROR);
-+            $this->API->logger('Found ' . \count($this->cache) . ' pending contexts', Logger::ERROR);
-             $this->cache = [];
-         }
-         if ($this->cacheContexts) {
--            $this->API->logger('Found '.\count($this->cacheContexts).' pending contexts', Logger::ERROR);
-+            $this->API->logger('Found ' . \count($this->cacheContexts) . ' pending contexts', Logger::ERROR);
-             $this->cacheContexts = [];
-         }
-     }
-@@ -227,7 +227,7 @@ final class ReferenceDatabase implements TLCallback
-             $frames = array_reverse($frames);
-             $tlTrace = array_shift($frames);
-             foreach ($frames as $frame) {
--                $tlTrace .= "['".$frame."']";
-+                $tlTrace .= "['" . $frame . "']";
-             }
-             $this->API->logger($tlTrace, Logger::ERROR);
-             return false;
-@@ -248,7 +248,7 @@ final class ReferenceDatabase implements TLCallback
-                 $locationType = self::PHOTO_LOCATION_LOCATION;
-                 break;
-             default:
--                throw new Exception('Unknown location type provided: '.$location['_']);
-+                throw new Exception('Unknown location type provided: ' . $location['_']);
-         }
-         $this->API->logger("Caching reference from location of type {$locationType} from {$location['_']}", Logger::ULTRA_VERBOSE);
-         if (!isset($this->cache[$key])) {
-@@ -312,7 +312,7 @@ final class ReferenceDatabase implements TLCallback
-                     foreach ($cache as $location => $reference) {
-                         $this->cache[$key][$location] = $reference;
-                     }
--                    $this->API->logger("Skipped origin {$originType} ({$data['_']}) for ".\count($cache).' references', Logger::ULTRA_VERBOSE);
-+                    $this->API->logger("Skipped origin {$originType} ({$data['_']}) for " . \count($cache) . ' references', Logger::ULTRA_VERBOSE);
-                     return;
-                 }
-                 $origin['max_id'] = $data['profile_photo']['id'];
-@@ -342,7 +342,7 @@ final class ReferenceDatabase implements TLCallback
-                     foreach ($cache as $location => $reference) {
-                         $this->cache[$key][$location] = $reference;
-                     }
--                    $this->API->logger("Skipped origin {$originType} ({$data['_']}) for ".\count($cache).' references', Logger::ULTRA_VERBOSE);
-+                    $this->API->logger("Skipped origin {$originType} ({$data['_']}) for " . \count($cache) . ' references', Logger::ULTRA_VERBOSE);
-                     return;
-                 }
-                 break;
-@@ -355,7 +355,7 @@ final class ReferenceDatabase implements TLCallback
-         foreach ($cache as $location => $reference) {
-             $this->storeReference($location, $reference, $originType, $origin);
-         }
--        $this->API->logger("Added origin {$originType} ({$data['_']}) to ".\count($cache).' references', Logger::ULTRA_VERBOSE);
-+        $this->API->logger("Added origin {$originType} ({$data['_']}) to " . \count($cache) . ' references', Logger::ULTRA_VERBOSE);
-     }
-     public function addOriginMethodContext(string $type): void
-     {
-@@ -435,7 +435,7 @@ final class ReferenceDatabase implements TLCallback
-         foreach ($cache as $location => $reference) {
-             $this->storeReference($location, $reference, $originType, $origin);
-         }
--        $this->API->logger("Added origin {$originType} ({$constructor}) to ".\count($cache).' references', Logger::ULTRA_VERBOSE);
-+        $this->API->logger("Added origin {$originType} ({$constructor}) to " . \count($cache) . ' references', Logger::ULTRA_VERBOSE);
-     }
-     private function storeReference(string $location, string $reference, int $originType, array $origin): void
-     {
-@@ -467,6 +467,9 @@ final class ReferenceDatabase implements TLCallback
+@@ -500,6 +500,9 @@ final class ReferenceDatabase implements TLCallback
          $ok = false;
          foreach ($queue as $locationString => $_) {
              $data = $this->getDb($locationString);
@@ -452,51 +374,6 @@ index e3c4904..dd78c3e 100644
              $data['reference'] = (string) $data['reference'];
              $count = 0;
              foreach ($data['origins'] ?? [] as $originType => $origin) {
-@@ -486,12 +489,12 @@ final class ReferenceDatabase implements TLCallback
-                             }
-                             $this->API->methodCallAsyncRead('messages.getMessages', ['id' => [$origin['msg_id']]]);
-                             break;
--                            // Peer + photo ID
-+                        // Peer + photo ID
-                         case self::PEER_PHOTO_ORIGIN:
-                             $this->API->peerDatabase->expireFull($origin['peer']);
-                             $this->API->getFullInfo($origin['peer']);
-                             break;
--                            // Peer (default photo ID)
-+                        // Peer (default photo ID)
-                         case self::USER_PHOTO_ORIGIN:
-                             $this->API->methodCallAsyncRead('photos.getUserPhotos', $origin);
-                             break;
-@@ -528,7 +531,7 @@ final class ReferenceDatabase implements TLCallback
-         }
-         if (!$ok) {
-             $count = \count($queue);
--            return static fn () => new Exception("Could not refresh file reference for any of the {$count} locations");
-+            return static fn() => new Exception("Could not refresh file reference for any of the {$count} locations");
-         }
-         return null;
-     }
-@@ -577,17 +580,17 @@ final class ReferenceDatabase implements TLCallback
-         switch ($locationType) {
-             case self::DOCUMENT_LOCATION:
-             case self::PHOTO_LOCATION:
--                return $locationType.bin2hex(Tools::packSignedLong($location['id']));
-+                return $locationType . bin2hex(Tools::packSignedLong($location['id']));
-             case self::PHOTO_LOCATION_LOCATION:
-                 $dc_id = Tools::packSignedInt($location['dc_id']);
-                 $volume_id = Tools::packSignedLong($location['volume_id']);
-                 $local_id = Tools::packSignedInt($location['local_id']);
--                return $locationType.bin2hex($dc_id.$volume_id.$local_id);
-+                return $locationType . bin2hex($dc_id . $volume_id . $local_id);
-         }
-         throw new Exception('Invalid location type specified!');
-     }
-     public function __debugInfo()
-     {
--        return ['ReferenceDatabase instance '.spl_object_hash($this)];
-+        return ['ReferenceDatabase instance ' . spl_object_hash($this)];
-     }
- }
 diff --git a/src/Settings/Ipc.php b/src/Settings/Ipc.php
 index 0ba694d..27180d9 100644
 --- a/src/Settings/Ipc.php

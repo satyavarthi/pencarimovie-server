@@ -5,9 +5,10 @@
   "require": {
     "php": ">=8.2",
     "cweagans/composer-patches": "^1.7",
-    "danog/madelineproto": "^8.4"
+    "danog/madelineproto": "^8.8"
   },
   "extra": {
+    "composer-exit-on-patch-failure": true,
     "patches": {
       "danog/madelineproto": {
         "Fix Windows IPC stream_socket_server notice": "patches/madelineproto-windows-ipc.patch"
