@@ -4,7 +4,7 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "23ed280d3c24937554de20f28f51f4e0",
+    "content-hash": "13adb0175e123fe9d6194ccd50170ed0",
     "packages": [
         {
             "name": "amphp/amp",
@@ -2054,16 +2054,16 @@
         },
         {
             "name": "danog/async-orm",
-            "version": "1.1.4",
+            "version": "1.1.5",
             "source": {
                 "type": "git",
                 "url": "https://github.com/danog/AsyncOrm.git",
-                "reference": "495f335d8ddb9dae8b773025911191f31c45e9ea"
+                "reference": "ec2afc07f6c25a8e40ab6b04df18845967e20b4c"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/danog/AsyncOrm/zipball/495f335d8ddb9dae8b773025911191f31c45e9ea",
-                "reference": "495f335d8ddb9dae8b773025911191f31c45e9ea",
+                "url": "https://api.github.com/repos/danog/AsyncOrm/zipball/ec2afc07f6c25a8e40ab6b04df18845967e20b4c",
+                "reference": "ec2afc07f6c25a8e40ab6b04df18845967e20b4c",
                 "shasum": ""
             },
             "require": {
@@ -2107,7 +2107,7 @@
             "description": "Async ORM based on AMPHP v3 and fibers.",
             "support": {
                 "issues": "https://github.com/danog/AsyncOrm/issues",
-                "source": "https://github.com/danog/AsyncOrm/tree/1.1.4"
+                "source": "https://github.com/danog/AsyncOrm/tree/1.1.5"
             },
             "funding": [
                 {
@@ -2115,7 +2115,7 @@
                     "type": "github"
                 }
             ],
-            "time": "2025-07-12T18:39:01+00:00"
+            "time": "2026-10-17T21:06:06+00:00"
         },
         {
             "name": "danog/better-prometheus",
@@ -2450,16 +2450,16 @@
         },
         {
             "name": "danog/madelineproto",
-            "version": "8.8.8",
+            "version": "8.9.0",
             "source": {
                 "type": "git",
                 "url": "https://github.com/danog/MadelineProto.git",
-                "reference": "1660c9ee2c0acdba3bf67144d3d6dd1fb9095515"
+                "reference": "eeed2199467b9fcff2d97fc6d269ddb4709861ee"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/danog/MadelineProto/zipball/1660c9ee2c0acdba3bf67144d3d6dd1fb9095515",
-                "reference": "1660c9ee2c0acdba3bf67144d3d6dd1fb9095515",
+                "url": "https://api.github.com/repos/danog/MadelineProto/zipball/eeed2199467b9fcff2d97fc6d269ddb4709861ee",
+                "reference": "eeed2199467b9fcff2d97fc6d269ddb4709861ee",
                 "shasum": ""
             },
             "require": {
@@ -2479,26 +2479,26 @@
                 "amphp/socket": "^2.4.1",
                 "amphp/websocket-client": "^2.0.2",
                 "bacon/bacon-qr-code": "^3.1.1",
-                "danog/async-orm": "^1.1.4",
+                "danog/async-orm": "^1.1.5",
                 "danog/better-prometheus": "^0.1.1",
                 "danog/dns-over-https": "^1.0.1",
                 "danog/ipc": "^1.0.1",
                 "danog/loop": "^1.1.1",
                 "danog/php-rtc-av": "^1.1.11",
-                "danog/php-rtc-codecs": "^1.1.18",
+                "danog/php-rtc-codecs": "^1.1.19",
                 "danog/php-rtc-datachannel": "^1.1.10",
-                "danog/php-rtc-dtls": "^2.0.15",
+                "danog/php-rtc-dtls": "^2.0.19",
                 "danog/php-rtc-exception": "^1.1.10",
-                "danog/php-rtc-ice": "^2.0.17",
+                "danog/php-rtc-ice": "^2.0.18",
                 "danog/php-rtc-mdns": "^1.1.12",
                 "danog/php-rtc-mixin": "^2.0.9",
-                "danog/php-rtc-ntp": "^1.1.12",
-                "danog/php-rtc-rtcp": "^1.1.10",
-                "danog/php-rtc-rtp": "^2.0.21",
+                "danog/php-rtc-ntp": "^1.1.14",
+                "danog/php-rtc-rtcp": "^1.1.11",
+                "danog/php-rtc-rtp": "^2.0.23",
                 "danog/php-rtc-rtp-parameter": "^1.1.8",
                 "danog/php-rtc-sctp": "^2.0.14",
                 "danog/php-rtc-sdp": "^1.1.12",
-                "danog/php-rtc-srtp": "^1.1.15",
+                "danog/php-rtc-srtp": "^1.1.16",
                 "danog/php-rtc-stats": "^1.1.7",
                 "danog/php-rtc-stun": "^2.0.18",
                 "danog/php-rtc-turn": "^2.0.9",
@@ -2592,7 +2592,7 @@
             ],
             "support": {
                 "issues": "https://github.com/danog/MadelineProto/issues",
-                "source": "https://github.com/danog/MadelineProto/tree/8.8.8"
+                "source": "https://github.com/danog/MadelineProto/tree/8.9.0"
             },
             "funding": [
                 {
@@ -2600,7 +2600,7 @@
                     "type": "github"
                 }
             ],
-            "time": "2026-10-16T20:07:58+00:00"
+            "time": "2026-10-18T11:18:56+00:00"
         },
         {
             "name": "danog/php-rtc-av",
@@ -2830,16 +2830,16 @@
         },
         {
             "name": "danog/php-rtc-dtls",
-            "version": "2.0.19",
+            "version": "2.0.20",
             "source": {
                 "type": "git",
                 "url": "https://github.com/danog/php-rtc-dtls.git",
-                "reference": "2329503d795226a352c8cfa5d5fa13226d02222a"
+                "reference": "794180b0c3cf54842df44b7bcb44f8fb50f199c8"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/danog/php-rtc-dtls/zipball/2329503d795226a352c8cfa5d5fa13226d02222a",
-                "reference": "2329503d795226a352c8cfa5d5fa13226d02222a",
+                "url": "https://api.github.com/repos/danog/php-rtc-dtls/zipball/794180b0c3cf54842df44b7bcb44f8fb50f199c8",
+                "reference": "794180b0c3cf54842df44b7bcb44f8fb50f199c8",
                 "shasum": ""
             },
             "require": {
@@ -2908,9 +2908,9 @@
             ],
             "support": {
                 "issues": "https://github.com/danog/php-rtc-dtls/issues",
-                "source": "https://github.com/danog/php-rtc-dtls/tree/2.0.19"
+                "source": "https://github.com/danog/php-rtc-dtls/tree/2.0.20"
             },
-            "time": "2026-10-17T19:18:17+00:00"
+            "time": "2026-10-17T20:02:59+00:00"
         },
         {
             "name": "danog/php-rtc-exception",
@@ -4034,16 +4034,16 @@
         },
         {
             "name": "danog/telegram-entities",
-            "version": "1.0.6",
+            "version": "1.1.0",
             "source": {
                 "type": "git",
                 "url": "https://github.com/danog/telegram-entities.git",
-                "reference": "ae430c8ff3532a31cbe305ab955cb7ca3f62065d"
+                "reference": "92ca7621594b7a6c4a820c3b557e66ee1d439273"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/danog/telegram-entities/zipball/ae430c8ff3532a31cbe305ab955cb7ca3f62065d",
-                "reference": "ae430c8ff3532a31cbe305ab955cb7ca3f62065d",
+                "url": "https://api.github.com/repos/danog/telegram-entities/zipball/92ca7621594b7a6c4a820c3b557e66ee1d439273",
+                "reference": "92ca7621594b7a6c4a820c3b557e66ee1d439273",
                 "shasum": ""
             },
             "require": {
@@ -4078,7 +4078,7 @@
             "description": "A library to work with Telegram UTF-16 styled text entities.",
             "support": {
                 "issues": "https://github.com/danog/telegram-entities/issues",
-                "source": "https://github.com/danog/telegram-entities/tree/1.0.6"
+                "source": "https://github.com/danog/telegram-entities/tree/1.1.0"
             },
             "funding": [
                 {
@@ -4086,7 +4086,7 @@
                     "type": "github"
                 }
             ],
-            "time": "2026-09-16T10:36:47+00:00"
+            "time": "2026-10-18T15:46:15+00:00"
         },
         {
             "name": "danog/tg-dialog-id",
