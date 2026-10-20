@@ -43,6 +43,19 @@ if (\function_exists('putenv') && !fd_env('MALLOC_ARENA_MAX')) {
     @putenv('MALLOC_ARENA_MAX=2');
 }
 
+// Shared hosting disables curl_multi_exec but leaves curl_multi_init et al, so the
+// three "Amp unavailable" fallbacks below would be a fatal
+// "Call to undefined function curl_multi_exec()". A no-op that reports "finished"
+// lets them return no bodies and fall through to the sequential paths instead.
+// Verified on ByetHost/iFastNet (PHP 8.4, disable_functions includes curl_multi_exec).
+if (!function_exists('curl_multi_exec')) {
+    function curl_multi_exec($multiHandle, &$stillRunning): int
+    {
+        $stillRunning = 0;
+        return CURLE_OK;
+    }
+}
+
 /**
  * API credentials are no longer hardcoded here.
  * They are fetched from the WordPress REST API endpoint (/save-bot-token)
@@ -165,7 +178,10 @@ define('FD_WP_API_BASE', 'https://pencarimovie.com/wp-json/pencarimovie-server/v
 // so the local SNI is a benign hostname.
 define('FD_WP_FALLBACK_HOST', 'telegra.my');
 define('FD_WP_API_BASE_FALLBACK', 'https://' . FD_WP_FALLBACK_HOST . '/wp-json/pencarimovie-server/v1');
-define('FD_APP_VERSION', is_file(__DIR__ . '/.release-tag') ? ltrim(trim((string) file_get_contents(__DIR__ . '/.release-tag')), 'v') : '2.7.7');
+// The fallback matters for a shared-hosting upload, which has no .release-tag:
+// with a stale fallback the WordPress version gate answers "Update required"
+// on every /stream request, so the addon lists one locked item and nothing plays.
+define('FD_APP_VERSION', is_file(__DIR__ . '/.release-tag') ? ltrim(trim((string) file_get_contents(__DIR__ . '/.release-tag')), 'v') : '2.7.9');
 define('FD_WP_VERSION_URL', FD_WP_API_BASE . '/version');
 define('FD_API_SECRET_PATH', fd_storage_path('storage/api_secret.key'));
 define('FD_BOT_ID_CACHE_PATH', fd_storage_path('storage/bot_id.txt'));
@@ -904,6 +920,14 @@ function fd_spawn_guest_provision(): bool
     }
     if (fd_is_guest_provision_in_progress()) {
         return true;
+    }
+    // Shared hosting: the background `backend.php provision` process and the
+    // loopback /api/provision request below can both be started here, but neither
+    // can outlive this request. /api/download still provisions synchronously via
+    // fd_auto_provision_guest(), so playback works — only the fire-and-forget
+    // stream-list warm loses its head start.
+    if (!fd_can_spawn_process()) {
+        return false;
     }
 
     $root = fd_get_app_root();
@@ -4123,6 +4147,12 @@ function fd_spawn_backend_cli(array $args): bool
         return false;
     }
 
+    // Shared hosting cannot spawn. Callers already handle `false` by doing the
+    // work inline (diagnostics, media_ids persist) or by reporting it unavailable.
+    if (!fd_can_spawn_process()) {
+        return false;
+    }
+
     $root = fd_get_app_root();
 
     // Determine PHP CLI binary
@@ -6578,6 +6608,13 @@ function fd_ipc_state_is_failed(string $stateFile): bool
  */
 function fd_ensure_ipc_worker(string $sessionDir, bool $waitForReady = true): bool
 {
+    // Shared hosting: no process can be spawned, so return at once. Without this
+    // the wait loop below burns its full 30s window and the request hits
+    // max_execution_time before fd_boot_madeline() ever gets to boot in-process.
+    if (!fd_can_spawn_process()) {
+        return false;
+    }
+
     if (fd_ipc_worker_ready($sessionDir)) {
         return true;
     }
@@ -6827,8 +6864,13 @@ function fd_boot_madeline(?string $botToken = null, array $overrides = [], strin
     // takes safe.php.lock/lightState.php.lock, destroys the live IPC worker,
     // and makes concurrent requests fail with "The endpoint does not exist!"
     // after a 30s tryConnect() retry loop.
-    $GLOBALS['FD_FORCE_FULL_BOOT'] = ($botToken !== null && $botToken !== '')
-        && !(is_dir($sessionPath) || is_file($sessionPath));
+    // Shared hosting cannot start an IPC worker, so every boot must be a full
+    // in-request deserialize. Without this MadelineProto tries to start its own
+    // worker through ProcessRunner (proc_open) and the request dies with
+    // "Could not connect to MadelineProto".
+    $GLOBALS['FD_FORCE_FULL_BOOT'] = !fd_can_spawn_process()
+        || (($botToken !== null && $botToken !== '')
+            && !(is_dir($sessionPath) || is_file($sessionPath)));
 
     $bootObLevel = ob_get_level();
     $bootEntryObLevel = $bootObLevel;
@@ -7072,7 +7114,10 @@ function fd_boot_madeline(?string $botToken = null, array $overrides = [], strin
             // here keeps it scoped to the single fresh-login boot it was
             // intended for, so every other boot takes the IPC client path and
             // performs no session save.
-            $GLOBALS['FD_FORCE_FULL_BOOT'] = false;
+            // On shared hosting every boot (including a retry inside the loop
+            // below) must stay a full deserialize — an IPC attempt there dies on
+            // the missing proc_open instead of falling back.
+            $GLOBALS['FD_FORCE_FULL_BOOT'] = !fd_can_spawn_process();
 
             // Try to resume existing session first.
             // The constructor already deserializes the session if present and logs
@@ -11117,6 +11162,40 @@ function fd_is_windows(): bool
         || defined('PHP_OS_FAMILY') && PHP_OS_FAMILY === 'Windows';
 }
 
+/**
+ * Can this PHP process start a background CLI process?
+ *
+ * Shared hosting (any cPanel host with `disable_functions` covering
+ * popen/proc_open/shell_exec/exec — ByetHost, Hostinger "single", most free
+ * plans) cannot spawn the detached MadelineProto IPC worker at all, and on
+ * Apache/FPM a child of a web request would not outlive it anyway. Every spawn
+ * site must therefore degrade instead of waiting for a worker that never comes:
+ * `fd_ensure_ipc_worker()` returning false makes fd_boot_madeline() fall back to
+ * a full in-request boot, which works but re-deserializes the session per
+ * request (~1-3s instead of ~50ms).
+ *
+ * FD_NO_SPAWN=1 forces the degraded mode even where spawning is allowed.
+ */
+function fd_can_spawn_process(): bool
+{
+    static $can = null;
+    if ($can !== null) {
+        return $can;
+    }
+    if ((string) fd_env('FD_NO_SPAWN', '') !== '') {
+        return $can = false;
+    }
+    // Disabled functions are removed from the function table, so function_exists()
+    // already covers `disable_functions`; the ini check covers suhosin-style setups.
+    $disabled = array_map('trim', explode(',', strtolower((string) ini_get('disable_functions'))));
+    foreach (['popen', 'proc_open', 'shell_exec', 'exec'] as $fn) {
+        if (function_exists($fn) && !in_array($fn, $disabled, true)) {
+            return $can = true;
+        }
+    }
+    return $can = false;
+}
+
 function fd_tunnel_dir(): string
 {
     $dir = fd_storage_path('storage/tunnel');
@@ -11410,7 +11489,14 @@ function fd_diag_counts(): array
 {
     $out = [];
     foreach (glob(fd_reports_dir() . DIRECTORY_SEPARATOR . '*.json') ?: [] as $path) {
-        $type = explode('_', basename($path))[0];
+        // Report files are "<type>_<unix_ms>.json". Splitting on '_' and taking [0]
+        // reported "playback" / "stream" instead of "playback_incident" /
+        // "stream_incident", so the Diagnostics dialog never showed the four
+        // documented categories. Strip ONLY the trailing timestamp.
+        $type = preg_replace('/_\d+\.json$/', '', basename($path));
+        if ($type === null || $type === '') {
+            $type = basename($path);
+        }
         $out[$type] = ($out[$type] ?? 0) + 1;
     }
     return $out;
@@ -11455,29 +11541,72 @@ function fd_diag_install_fatal_handlers(): void
             //     may be empty as well, but the connection was NOT aborted.
             $clientAborted = connection_aborted() || connection_status() === CONNECTION_ABORTED;
             $fatal = is_array($err) && !empty($err['message']);
-            $reason = $clientAborted ? 'CLIENT_ABORTED' : ($fatal ? 'WORKER_CRASHED_FATAL' : 'WORKER_CRASHED');
-            fd_diag_record(
-                'playback_incident',
-                ($clientAborted ? 'Client stopped the download: ' : 'Download aborted the PHP worker: ')
-                    . (string) ($inflight['short_code'] ?? $inflight['file_id'] ?? ''),
-                $clientAborted
-                    ? 'downloadToBrowser() was interrupted by the client (seek / closed player / range complete)'
-                    : 'downloadToBrowser() never returned — the process died mid-request',
-                '',
-                $reason,
-                '',
-                (string) ($inflight['short_code'] ?? ''),
-                (int) round((microtime(true) - (float) ($inflight['started'] ?? microtime(true))) * 1000),
-                [
-                    'file_id' => (string) ($inflight['file_id'] ?? ''),
-                    'error'   => (string) ($err['message'] ?? ''),
-                    'connection_aborted' => connection_aborted(),
-                    'connection_status'  => connection_status(),
-                    'ignore_user_abort'  => (int) ignore_user_abort(),
-                    'http_response_code' => http_response_code(),
-                    'ob_level'           => ob_get_level(),
-                ]
-            );
+
+            // A client going away is the NORMAL end of most requests: the player fills
+            // its buffer (or does a seek) and closes while the script is mid-write, so
+            // PHP kills it before downloadToBrowser() returns. Reporting each one made
+            // the table useless — one user watching four titles produced 24
+            // playback_incident rows in 15 minutes, which buried every real failure.
+            //
+            // What IS worth an incident is a RETRY LOOP: the same item aborting 3+ times
+            // inside a minute, the signature of a stream the player refuses outright
+            // (e.g. an MPEG-TS file advertised as .mp4 re-opens every ~2s forever).
+            // Count first, report from the third abort on.
+            $abortCount = 0;
+            $reportIt = !$clientAborted;
+            if ($clientAborted) {
+                $abortKey = md5((string) ($inflight['short_code'] ?? '') . '|' . (string) ($inflight['file_id'] ?? ''));
+                $abortFile = fd_cache_path('abort_' . $abortKey . '.json');
+                $recent = [];
+                if (is_file($abortFile)) {
+                    $decoded = json_decode((string) @file_get_contents($abortFile), true);
+                    if (is_array($decoded)) {
+                        $recent = $decoded;
+                    }
+                }
+                $cutoff = time() - 60;
+                $recent = array_values(array_filter(
+                    $recent,
+                    static fn($t): bool => (int) $t >= $cutoff
+                ));
+                $recent[] = time();
+                @file_put_contents($abortFile, json_encode($recent), LOCK_EX);
+                $abortCount = count($recent);
+                $reportIt = $abortCount >= 3;
+                if (!$reportIt) {
+                    fd_log('client abort (normal seek/close), not reported', [
+                        'short_code'      => (string) ($inflight['short_code'] ?? ''),
+                        'aborts_last_60s' => $abortCount,
+                    ]);
+                }
+            }
+
+            if ($reportIt) {
+                $reason = $clientAborted ? 'CLIENT_ABORTED' : ($fatal ? 'WORKER_CRASHED_FATAL' : 'WORKER_CRASHED');
+                fd_diag_record(
+                    'playback_incident',
+                    ($clientAborted ? 'Client stopped the download: ' : 'Download aborted the PHP worker: ')
+                        . (string) ($inflight['short_code'] ?? $inflight['file_id'] ?? ''),
+                    $clientAborted
+                        ? 'The player reopened this item ' . $abortCount . 'x in 60s without finishing'
+                        : 'downloadToBrowser() never returned — the process died mid-request',
+                    '',
+                    $reason,
+                    '',
+                    (string) ($inflight['short_code'] ?? ''),
+                    (int) round((microtime(true) - (float) ($inflight['started'] ?? microtime(true))) * 1000),
+                    [
+                        'file_id' => (string) ($inflight['file_id'] ?? ''),
+                        'error'   => (string) ($err['message'] ?? ''),
+                        'aborts_last_60s'    => $abortCount,
+                        'connection_aborted' => connection_aborted(),
+                        'connection_status'  => connection_status(),
+                        'ignore_user_abort'  => (int) ignore_user_abort(),
+                        'http_response_code' => http_response_code(),
+                        'ob_level'           => ob_get_level(),
+                    ]
+                );
+            }
         }
 
         // (b) A genuine PHP fatal.
@@ -12816,6 +12945,10 @@ function fd_tunnel_spawn(string $bin, string $localUrl, int $metricsPort = 20241
             'TEMP' => sys_get_temp_dir(),
             'TMP' => sys_get_temp_dir(),
         ];
+
+        if (!fd_can_spawn_process()) {
+            return [0, 'Cloudflare Tunnel needs a process-capable host (popen/proc_open are disabled here).'];
+        }
 
         $pipes = [];
         $proc = @proc_open($cmdLine, $descriptors, $pipes, dirname($binReal), $env, [
@@ -18027,6 +18160,13 @@ if ($isNuvioRoute) {
             // Diagnostics: "I pressed Play and got nothing" — the most reported
             // user-visible failure, and the two causes need different fixes.
             $diagFiltered = !empty($totalFilesBeforeFilter) && $totalFilesBeforeFilter > 0;
+            // "3 file(s) matched but the active stream filters hid them" is not
+            // actionable without knowing WHICH filters were active — six live rows from
+            // one aarch64 device carried only item_type/title/year, so the cause could
+            // not be told apart from a user's own keyword list. Record the filter config.
+            $diagStreamCfg = (isset($catSettings['stream_config']) && is_array($catSettings['stream_config']))
+                ? $catSettings['stream_config']
+                : [];
             fd_diag_record(
                 'stream_incident',
                 'No playable streams: ' . (string) ($itemId ?? ''),
@@ -18044,6 +18184,22 @@ if ($isNuvioRoute) {
                     'year'                => (string) ($searchedYear ?? ''),
                     'files_before_filter' => (int) ($totalFilesBeforeFilter ?? 0),
                     'streams_built'       => count($streams),
+                    'filter_config'       => $diagFiltered ? [
+                        'resolutions'                => (array) ($diagStreamCfg['resolutions'] ?? []),
+                        'qualities'                  => (array) ($diagStreamCfg['qualities'] ?? []),
+                        'encodes'                    => (array) ($diagStreamCfg['encodes'] ?? []),
+                        'visual_tags'                => (array) ($diagStreamCfg['visual_tags'] ?? []),
+                        'preferred_resolution'       => (string) ($diagStreamCfg['preferred_resolution'] ?? ''),
+                        'max_streams_per_resolution' => (int) ($diagStreamCfg['max_streams_per_resolution'] ?? 0),
+                        'max_streams_total'          => (int) ($diagStreamCfg['max_streams_total'] ?? 0),
+                        'min_size_mb'                => (int) ($diagStreamCfg['min_size_mb'] ?? 0),
+                        'max_size_gb'                => (int) ($diagStreamCfg['max_size_gb'] ?? 0),
+                        'exclude_cam'                => !empty($diagStreamCfg['exclude_cam']),
+                        'exclude_unplayable'         => !empty($diagStreamCfg['exclude_unplayable']),
+                        'exclude_part_title'         => !empty($diagStreamCfg['exclude_part_title']),
+                        'excluded_keywords'          => (string) ($diagStreamCfg['excluded_keywords'] ?? ''),
+                        'required_keywords'          => (string) ($diagStreamCfg['required_keywords'] ?? ''),
+                    ] : null,
                 ]
             );
 
@@ -19794,6 +19950,23 @@ if (str_starts_with($path, '/api/')) {
                 if (stripos($errMsg, 'not allowed') !== false || stripos($errMsg, 'unauthorized') !== false || stripos($errMsg, 'forbidden') !== false) {
                     $statusCode = 403;
                 }
+                // A rate limit is RETRYABLE and must not be reported as 404 / UNRESOLVED.
+                // Live rows from a Termux build (app 2.8.8, short_code r3dkc6) showed
+                // "Upstream Telegram rate limit, please retry shortly." recorded four
+                // times in 54s as status=404 reason=UNRESOLVED — so the client treats the
+                // file as gone, and the incident hides that the real cause was a flood
+                // wait. 429 + Retry-After is what a retryable failure looks like.
+                if ($statusCode === 404 && (
+                    stripos($errMsg, 'rate limit') !== false
+                    || stripos($errMsg, 'too many') !== false
+                    || stripos($errMsg, 'flood') !== false
+                    || stripos($errMsg, 'retry shortly') !== false
+                    || stripos($errMsg, 'try again in') !== false
+                    || stripos($errMsg, 'wait of') !== false
+                )) {
+                    $statusCode = 429;
+                    header('Retry-After: 15');
+                }
 
                 header('Cache-Control: no-cache, no-store, must-revalidate');
                 header('Connection: close');
@@ -19804,7 +19977,7 @@ if (str_starts_with($path, '/api/')) {
                     'Download unresolved: ' . ($shortCode !== '' ? $shortCode : 'no short_code'),
                     $errMsg,
                     '',
-                    $statusCode === 403 ? 'NOT_AUTHORIZED' : 'UNRESOLVED',
+                    $statusCode === 403 ? 'NOT_AUTHORIZED' : ($statusCode === 429 ? 'RATE_LIMITED' : 'UNRESOLVED'),
                     '',
                     (string) $shortCode,
                     0,

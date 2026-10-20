@@ -455,3 +455,33 @@ index e7f2597..3fcfcbb 100644
 +            });
 +
              while (true) {
+
+diff --git a/src/MTProto.php b/src/MTProto.php
+--- a/src/MTProto.php
++++ b/src/MTProto.php
+@@ -1143,11 +1143,23 @@ final class MTProto implements TLCallback, LoggerGetter, SettingsGetter
+         }
+         $this->updateCtr = $this->getPromCounter("MadelineProto", "update_count", "Number of received updates since the session was created");
+         // Start IPC server
+-        if (!$this->ipcServer) {
++        //
++        // Shared hosting (cPanel/ByetHost: `disable_functions` covers
++        // stream_socket_server, posix_mkfifo, pfsockopen) can never serve an IPC
++        // endpoint, and this instance is used strictly in-process there, so the
++        // endpoint is never dialled. Without this guard `new Server($this)` dies
++        // with "Call to undefined function stream_socket_server()" during
++        // initialize() and MadelineProto cannot boot at all.
++        // No-op on every host that has stream_socket_server (Windows, Linux,
++        // Termux, FrankenPHP). Kept in patches/madelineproto-windows-ipc.patch.
++        $fdCanServeIpc = \function_exists('stream_socket_server') || \function_exists('posix_mkfifo');
++        if (!$this->ipcServer && $fdCanServeIpc) {
+             $this->ipcServer = new Server($this);
+             $this->ipcServer->setIpcPath($this->wrapper->getSession());
+         }
+-        $this->ipcServer->start();
++        if ($this->ipcServer) {
++            $this->ipcServer->start();
++        }
+         if (!isset($this->updateQueue)) {
+             $q = new SplQueue;
+             $q->setIteratorMode(SplQueue::IT_MODE_DELETE);
